@@ -187,6 +187,9 @@ def init_db():
                      (user_id INTEGER PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS admins
                      (user_id INTEGER PRIMARY KEY)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS running_scripts
+                     (user_id INTEGER, file_name TEXT, start_time TEXT,
+                      PRIMARY KEY (user_id, file_name))''')
 
         # Ensure admins
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
@@ -229,10 +232,46 @@ def load_data():
         c.execute('SELECT user_id FROM admins')
         admin_ids.update(user_id for (user_id,) in c.fetchall())
 
+        # Load running scripts and auto-restart them
+        c.execute('SELECT user_id, file_name, start_time FROM running_scripts')
+        for user_id, file_name, start_time in c.fetchall():
+            user_folder = get_user_folder(user_id)
+            file_path = os.path.join(user_folder, file_name)
+            if os.path.exists(file_path):
+                logger.info(f"Auto-restarting script: {file_name} for user {user_id}")
+                success, result = execute_script(user_id, file_path)
+                if success:
+                    logger.info(f"Successfully auto-restarted: {file_name}")
+                else:
+                    logger.error(f"Failed to auto-restart {file_name}: {result}")
+
         conn.close()
         logger.info(f"Data loaded: {len(active_users)} users, {len(user_files)} file records")
     except Exception as e:
         logger.error(f"Error loading data: {e}")
+
+def save_running_script(user_id, file_name):
+    """Save running script to database for auto-restart"""
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO running_scripts (user_id, file_name, start_time) VALUES (?, ?, ?)',
+                 (user_id, file_name, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error saving running script: {e}")
+
+def remove_running_script(user_id, file_name):
+    """Remove running script from database"""
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('DELETE FROM running_scripts WHERE user_id = ? AND file_name = ?', (user_id, file_name))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error removing running script: {e}")
 
 # --- Helper Functions ---
 def get_user_folder(user_id):
@@ -272,6 +311,15 @@ def is_bot_running(script_owner_id, file_name):
         except Exception:
             return False
     return False
+
+def get_script_uptime(script_owner_id, file_name):
+    """Get the uptime of a running script"""
+    script_key = f"{script_owner_id}_{file_name}"
+    script_info = bot_scripts.get(script_key)
+    if script_info and script_info.get('start_time'):
+        uptime = datetime.now() - script_info['start_time']
+        return str(uptime).split('.')[0]  # Remove microseconds
+    return None
 
 def safe_send_message(chat_id, text, parse_mode=None, reply_markup=None):
     """Safely send message with fallback for parse errors"""
@@ -681,13 +729,17 @@ def execute_script(user_id, script_path, message_for_updates=None):
                 'icon': lang_info['icon']
             }
 
+            # Save to database for auto-restart
+            save_running_script(user_id, script_name)
+
             # Success message
             if message_for_updates:
                 success_msg = f"{lang_info['icon']} {lang_info['name']} script started successfully!\n\n"
                 success_msg += f"File: {script_name}\n"
                 success_msg += f"Process ID: {process.pid}\n"
                 success_msg += f"Language: {lang_info['name']} {lang_info['icon']}\n"
-                success_msg += f"Status: Running"
+                success_msg += f"Status: Running\n"
+                success_msg += f"⏰ Start Time: {datetime.now().strftime('%H:%M:%S')}"
 
                 safe_edit_message(
                     message_for_updates.chat.id, 
@@ -709,6 +761,141 @@ def execute_script(user_id, script_path, message_for_updates=None):
             )
 
         return False, error_msg
+
+# --- Subscription Management Commands ---
+@bot.message_handler(commands=['addsub'])
+def add_subscription(message):
+    """Add subscription to a user"""
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
+        return
+
+    try:
+        parts = message.text.split()
+        if len(parts) != 3:
+            safe_reply_to(message, "❌ Usage: /addsub <user_id> <days>")
+            return
+
+        target_user_id = int(parts[1])
+        days = int(parts[2])
+        
+        expiry_date = datetime.now() + timedelta(days=days)
+        user_subscriptions[target_user_id] = {'expiry': expiry_date}
+        
+        # Save to database
+        try:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute('INSERT OR REPLACE INTO subscriptions (user_id, expiry) VALUES (?, ?)',
+                     (target_user_id, expiry_date.isoformat()))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Database error saving subscription: {e}")
+
+        safe_reply_to(message, f"✅ Subscription added!\n\nUser: {target_user_id}\nDays: {days}\nExpiry: {expiry_date.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    except Exception as e:
+        safe_reply_to(message, f"❌ Error: {str(e)}")
+
+@bot.message_handler(commands=['removesub'])
+def remove_subscription(message):
+    """Remove subscription from a user"""
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
+        return
+
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            safe_reply_to(message, "❌ Usage: /removesub <user_id>")
+            return
+
+        target_user_id = int(parts[1])
+        
+        if target_user_id in user_subscriptions:
+            del user_subscriptions[target_user_id]
+            
+            # Remove from database
+            try:
+                conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+                c = conn.cursor()
+                c.execute('DELETE FROM subscriptions WHERE user_id = ?', (target_user_id,))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logger.error(f"Database error removing subscription: {e}")
+
+            safe_reply_to(message, f"✅ Subscription removed!\n\nUser: {target_user_id}")
+        else:
+            safe_reply_to(message, f"❌ No subscription found for user: {target_user_id}")
+
+    except Exception as e:
+        safe_reply_to(message, f"❌ Error: {str(e)}")
+
+@bot.message_handler(commands=['checksub'])
+def check_subscription(message):
+    """Check subscription status of a user"""
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
+        return
+
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            safe_reply_to(message, "❌ Usage: /checksub <user_id>")
+            return
+
+        target_user_id = int(parts[1])
+        
+        if target_user_id in user_subscriptions:
+            expiry = user_subscriptions[target_user_id]['expiry']
+            is_active = expiry > datetime.now()
+            status = "🟢 ACTIVE" if is_active else "🔴 EXPIRED"
+            
+            sub_info = f"📊 Subscription Status\n\n"
+            sub_info += f"User ID: {target_user_id}\n"
+            sub_info += f"Status: {status}\n"
+            sub_info += f"Expiry: {expiry.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            sub_info += f"Time Left: {str(expiry - datetime.now()).split('.')[0] if is_active else 'Expired'}"
+            
+            safe_reply_to(message, sub_info)
+        else:
+            safe_reply_to(message, f"❌ No subscription found for user: {target_user_id}")
+
+    except Exception as e:
+        safe_reply_to(message, f"❌ Error: {str(e)}")
+
+@bot.message_handler(commands=['users'])
+def list_users(message):
+    """List all active users with details"""
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
+        return
+
+    if not active_users:
+        safe_reply_to(message, "📊 No active users found.")
+        return
+
+    users_text = f"📊 Active Users: {len(active_users)}\n\n"
+    
+    for i, user_id in enumerate(list(active_users)[:50], 1):  # Show first 50 users
+        file_count = get_user_file_count(user_id)
+        is_subscribed = user_id in user_subscriptions and user_subscriptions[user_id]['expiry'] > datetime.now()
+        subscription_status = "🟢 SUBSCRIBED" if is_subscribed else "🔴 FREE"
+        
+        users_text += f"{i}. User ID: {user_id}\n"
+        users_text += f"   Files: {file_count}\n"
+        users_text += f"   Status: {subscription_status}\n\n"
+
+    if len(active_users) > 50:
+        users_text += f"... and {len(active_users) - 50} more users"
+
+    safe_reply_to(message, users_text)
 
 # --- Command Handlers ---
 @bot.message_handler(commands=['start'])
@@ -1043,8 +1230,16 @@ def check_files_button(message):
 
     for i, (file_name, file_type) in enumerate(files, 1):
         if file_type == 'executable':
-            status = "🟢 Running" if is_bot_running(user_id, file_name) else "⭕ Stopped"
+            is_running = is_bot_running(user_id, file_name)
+            status = "🟢 Running" if is_running else "⭕ Stopped"
             icon = "🚀"
+            
+            # Add uptime info if running
+            if is_running:
+                uptime = get_script_uptime(user_id, file_name)
+                if uptime:
+                    status += f" (Uptime: {uptime})"
+            
             files_text += f"{i}. {file_name} ({file_type})\n   Status: {status}\n\n"
         else:
             status = "📁 Hosted"
@@ -1358,16 +1553,23 @@ def subscriptions_button(message):
     subs_text += "📊 Commands:\n"
     subs_text += "• /addsub <user_id> <days> - Add subscription\n"
     subs_text += "• /removesub <user_id> - Remove subscription\n"
-    subs_text += "• /checksub <user_id> - Check subscription status\n\n"
+    subs_text += "• /checksub <user_id> - Check subscription status\n"
+    subs_text += "• /users - List all active users\n\n"
     subs_text += "📈 Current Subscriptions:\n"
 
     # Add current subscriptions info
     active_subs = 0
+    expired_subs = 0
     for user_id_sub, sub_info in user_subscriptions.items():
         if sub_info['expiry'] > datetime.now():
             active_subs += 1
+        else:
+            expired_subs += 1
 
-    subs_text += f"Active: {active_subs} users"
+    subs_text += f"🟢 Active: {active_subs} users\n"
+    subs_text += f"🔴 Expired: {expired_subs} users\n"
+    subs_text += f"📊 Total: {len(user_subscriptions)} users"
+    
     safe_reply_to(message, subs_text)
 
 @bot.message_handler(func=lambda message: message.text == "📢 Broadcast")
@@ -1481,10 +1683,12 @@ def running_code_button(message):
         language = script_info.get('language', 'Unknown')
         icon = script_info.get('icon', '📄')
         start_time = script_info['start_time'].strftime("%H:%M:%S")
+        uptime = get_script_uptime(user_id_script, file_name) or "Unknown"
         
         running_text += f"{icon} {file_name} ({language})\n"
         running_text += f"👤 User: {user_id_script}\n"
         running_text += f"⏰ Started: {start_time}\n"
+        running_text += f"⏱️ Uptime: {uptime}\n"
         running_text += f"🆔 PID: {script_info['process'].pid}\n\n"
 
     safe_reply_to(message, running_text)
@@ -1505,9 +1709,9 @@ def admin_panel_button(message):
     admin_text += f"🛠️ Available Commands:\n"
     admin_text += f"• /addsub <user_id> <days> - Add subscription\n"
     admin_text += f"• /removesub <user_id> - Remove subscription\n"
-    admin_text += f"• /broadcast - Send broadcast message\n"
-    admin_text += f"• /addadmin <user_id> - Add admin\n"
-    admin_text += f"• /removeadmin <user_id> - Remove admin\n\n"
+    admin_text += f"• /checksub <user_id> - Check subscription status\n"
+    admin_text += f"• /users - List all active users\n"
+    admin_text += f"• /broadcast - Send broadcast message\n\n"
     admin_text += f"📈 Use the admin buttons for quick actions!"
 
     safe_reply_to(message, admin_text)
@@ -1570,6 +1774,7 @@ def handle_file_control(call):
             is_running = is_bot_running(user_id, file_name)
             
             if is_running:
+                uptime = get_script_uptime(user_id, file_name) or "Unknown"
                 markup.add(
                     types.InlineKeyboardButton("🔴 Stop", callback_data=f'stop_{user_id}_{file_name}'),
                     types.InlineKeyboardButton("🔄 Restart", callback_data=f'restart_{user_id}_{file_name}')
@@ -1618,6 +1823,12 @@ def handle_file_control(call):
         control_text += f"📄 File: {file_name}\n"
         control_text += f"📁 Type: {file_type}\n"
         control_text += f"🔄 Status: {status}\n"
+        
+        if file_type == 'executable' and is_running:
+            uptime = get_script_uptime(user_id, file_name)
+            if uptime:
+                control_text += f"⏱️ Uptime: {uptime}\n"
+        
         control_text += f"👤 Owner: {user_id}\n\n"
         control_text += f"🎛️ Choose an action:"
         
@@ -1661,10 +1872,12 @@ def handle_start_file(call):
             return
             
         # Start the script
+        start_time = time.time()
         success, result = execute_script(user_id, file_path)
+        execution_time = round(time.time() - start_time, 2)
         
         if success:
-            bot.answer_callback_query(call.id, "🟢 Started successfully!")
+            bot.answer_callback_query(call.id, f"🟢 Started in {execution_time}s!")
             # Refresh the control panel
             call.data = f'control_{user_id}_{file_name}'
             handle_file_control(call)
@@ -1694,12 +1907,20 @@ def handle_stop_file(call):
         
         if script_info and script_info.get('process'):
             try:
+                # Calculate runtime before stopping
+                runtime = get_script_uptime(user_id, file_name) or "Unknown"
+                
                 process = script_info['process']
                 process.terminate()
                 process.wait(timeout=5)
-                del bot_scripts[script_key]
                 
-                bot.answer_callback_query(call.id, "🔴 Stopped successfully!")
+                # Remove from database
+                remove_running_script(user_id, file_name)
+                
+                if script_key in bot_scripts:
+                    del bot_scripts[script_key]
+                
+                bot.answer_callback_query(call.id, f"🔴 Stopped! Runtime: {runtime}")
                 # Refresh the control panel
                 call.data = f'control_{user_id}_{file_name}'
                 handle_file_control(call)
@@ -1734,7 +1955,9 @@ def handle_restart_file(call):
                 process = script_info['process']
                 process.terminate()
                 process.wait(timeout=5)
-                del bot_scripts[script_key]
+                remove_running_script(user_id, file_name)
+                if script_key in bot_scripts:
+                    del bot_scripts[script_key]
             except:
                 pass
         
@@ -1743,10 +1966,12 @@ def handle_restart_file(call):
         file_path = os.path.join(user_folder, file_name)
         
         if os.path.exists(file_path):
+            start_time = time.time()
             success, result = execute_script(user_id, file_path)
+            execution_time = round(time.time() - start_time, 2)
             
             if success:
-                bot.answer_callback_query(call.id, "🔄 Restarted successfully!")
+                bot.answer_callback_query(call.id, f"🔄 Restarted in {execution_time}s!")
                 # Refresh the control panel
                 call.data = f'control_{user_id}_{file_name}'
                 handle_file_control(call)
@@ -1826,6 +2051,7 @@ def handle_delete_file(call):
             try:
                 process = bot_scripts[script_key]['process']
                 process.terminate()
+                remove_running_script(user_id, file_name)
                 del bot_scripts[script_key]
             except:
                 pass
@@ -1845,6 +2071,7 @@ def handle_delete_file(call):
             conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
             c = conn.cursor()
             c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
+            c.execute('DELETE FROM running_scripts WHERE user_id = ? AND file_name = ?', (user_id, file_name))
             conn.commit()
             conn.close()
         except Exception as e:
@@ -1878,8 +2105,16 @@ def handle_back_to_files(call):
             
             for i, (file_name, file_type) in enumerate(files, 1):
                 if file_type == 'executable':
-                    status = "🟢 Running" if is_bot_running(user_id, file_name) else "⭕ Stopped"
+                    is_running = is_bot_running(user_id, file_name)
+                    status = "🟢 Running" if is_running else "⭕ Stopped"
                     icon = "🚀"
+                    
+                    # Add uptime info if running
+                    if is_running:
+                        uptime = get_script_uptime(user_id, file_name)
+                        if uptime:
+                            status += f" (Uptime: {uptime})"
+                    
                     files_text += f"{i}. {file_name} ({file_type})\n   Status: {status}\n\n"
                 else:
                     status = "📁 Hosted"
@@ -1985,6 +2220,8 @@ if __name__ == "__main__":
         print(f"📢 Broadcast feature: Working perfectly")
         print(f"🤖 Clone feature: COMPLETELY FIXED - Cloned bots will have ALL features!")
         print(f"💡 Users can now clone the bot using /settoken command")
+        print(f"⏰ Auto-restart feature: All scripts will restart automatically on bot reboot")
+        print(f"📊 Enhanced admin panel: Now with user management and subscription system")
         
         # Start polling with error handling
         bot.infinity_polling(timeout=10, long_polling_timeout=5, none_stop=True, interval=0)
